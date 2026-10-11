@@ -1,0 +1,78 @@
+{
+    "active_toolchain": "clang-x64",
+    "toolchains": {
+        "msvc-x64": {
+            "arch": "x64",
+            "vcvars_path": "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Auxiliary\\Build\\vcvars64.bat",
+            "rust_target": "x86_64-pc-windows-msvc",
+            "c_compiler": "cl",
+            "cxx_compiler": "cl"
+        },
+        "msvc-x86": {
+            "arch": "x86",
+            "vcvars_path": "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Auxiliary\\Build\\vcvars32.bat",
+            "rust_target": "i686-pc-windows-msvc",
+            "c_compiler": "cl",
+            "cxx_compiler": "cl"
+        },
+        "msvc-arm64": {
+            "arch": "arm64",
+            "vcvars_path": "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Auxiliary\\Build\\vcvarsx86_arm64.bat",
+            "rust_target": "aarch64-pc-windows-msvc",
+            "c_compiler": "cl",
+            "cxx_compiler": "cl"
+        },
+        "clang-x64": {
+            "arch": "x64",
+            "bin_path": "C:\\LLVM\\bin",
+            "rust_target": "x86_64-pc-windows-gnu",
+            "c_compiler": "clang",
+            "cxx_compiler": "clang++",
+            "extra_flags": "--target=x86_64-w64-windows-gnu -fuse-ld=lld"
+        },
+        "clang-x86": {
+            "arch": "x86",
+            "bin_path": "C:\\LLVM\\bin",
+            "rust_target": "i686-pc-windows-gnu",
+            "c_compiler": "clang",
+            "cxx_compiler": "clang++",
+            "extra_flags": "--target=i686-w64-windows-gnu -fuse-ld=lld"
+        },
+        "clang-arm64": {
+            "arch": "arm64",
+            "bin_path": "C:\\LLVM\\bin",
+            "rust_target": "aarch64-pc-windows-gnullvm",
+            "c_compiler": "clang",
+            "cxx_compiler": "clang++",
+            "extra_flags": "--target=aarch64-w64-windows-gnu -fuse-ld=lld"
+        },
+        "mingw-x64": {
+            "arch": "x64",
+            "bin_path": "C:\\mingw64\\bin",
+            "rust_target": "x86_64-pc-windows-gnu",
+            "c_compiler": "gcc",
+            "cxx_compiler": "g++",
+            "extra_flags": ""
+        },
+        "mingw-x86": {
+            "arch": "x86",
+            "bin_path": "C:\\mingw32\\bin",
+            "rust_target": "i686-pc-windows-gnu",
+            "c_compiler": "gcc",
+            "cxx_compiler": "g++",
+            "extra_flags": ""
+        }
+    },
+    "tools": {
+        "cmake": "cmake",
+        "ninja": "..\\bin\\ninja.exe",
+        "cargo": "cargo",
+        "rustc": "rustc",
+        "upx": "C:\\upx-5.1.1-win64\\upx.exe"
+    },
+    "build_options": {
+        "hide_console": true,
+        "upx_compress": false,
+        "upx_level": "--ultra-brute --lzma"
+    }
+}

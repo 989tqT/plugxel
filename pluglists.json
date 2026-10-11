@@ -1,0 +1,14 @@
+{
+  "repo_version": "1.0.0",
+  "plugins": [
+    {
+      "name": "pTerm",
+      "author": "plugxel",
+      "version": "1.0.1",
+      "description": "Terminal environment",
+      "official": true,
+      "sha256": "9ada6ad5b1026e126bfc212364d1ad9876c0d280b6477498d8a2220e99091f14",
+      "permissions_hash": "9951c3f78387b0c78e75cb44bc8b4b44a9a4d9c35030c93e2eff1ef8e1d6dcda"
+    }
+  ]
+}

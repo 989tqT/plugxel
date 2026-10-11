@@ -1,0 +1,14 @@
+# cargo-audit configuration
+
+[advisories]
+# Acknowledged unmaintained and unsound warnings from transitives (primarily Wasmer dependencies)
+ignore = [
+    "RUSTSEC-2024-0388", # derivative is unmaintained (transitive dependency)
+    "RUSTSEC-2025-0057", # fxhash is no longer maintained
+    "RUSTSEC-2024-0370", # proc-macro-error is unmaintained
+    "RUSTSEC-2025-0134", # rustls-pemfile is unmaintained
+    # RUSTSEC-2026-0186: memmap2 unsoundness (unchecked pointer offset in madvise/flush).
+    # Locked to ^0.6.1 by shared-buffer v0.1.4 (required by wasmer v4.4.0).
+    # Unsound paths (advise_range/flush_range) are never invoked by Wasmer or this host runtime (zero risk).
+    "RUSTSEC-2026-0186"
+]

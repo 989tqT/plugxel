@@ -1,0 +1,33 @@
+name: Documentation Validator
+
+on:
+  push:
+    branches: [ trunk, main ]
+    paths:
+      - '**.md'
+      - 'docs/**'
+  pull_request:
+    branches: [ trunk, main ]
+    paths:
+      - '**.md'
+      - 'docs/**'
+
+jobs:
+  validate-markdown:
+    name: Lint Markdown Files
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install markdownlint-cli
+        run: npm install -g markdownlint-cli
+
+      - name: Lint Markdown Files
+        run: |
+          markdownlint --config .github/markdownlint.json "**/*.md" --ignore "plug.app/rt/target/**" --ignore "node_modules/**"

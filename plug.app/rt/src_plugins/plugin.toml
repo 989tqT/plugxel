@@ -1,0 +1,6 @@
+[[plugin]]
+name = "pTerm"
+version = "1.0.1"
+author = "plugxel"
+api_version = "0.1.2a"
+permissions = ["host_exec", "host_add_tab", "host_set_tab_owner", "host_get_tab_label", "host_get_platform"]

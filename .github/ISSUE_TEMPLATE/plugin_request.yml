@@ -1,0 +1,30 @@
+name: "Plugin Request / Submission"
+description: "Propose a new plugin or submit a plugin for registration."
+labels: ["plugin"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: "Plugin Description"
+      description: "Describe the plugin features, use case, and target audience."
+    validations:
+      required: true
+  - type: dropdown
+    id: permissions
+    attributes:
+      label: "Required FFI Permissions"
+      description: "Select the most critical permission required by your plugin."
+      options:
+        - "None (Pure sandboxed computation)"
+        - "main_w_add_tab (Tab management)"
+        - "host_exec (Subprocess execution - subject to strict allowlist)"
+        - "Other (Specify in description)"
+    validations:
+      required: true
+  - type: checkboxes
+    id: security_agreement
+    attributes:
+      label: "Security Acknowledgement"
+      options:
+        - label: "I understand that third-party plugins run inside an untrusted sandbox and do not receive unrestricted host_exec capabilities, which are granted only with explicit consent."
+          required: true

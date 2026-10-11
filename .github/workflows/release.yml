@@ -1,0 +1,139 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows Release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown, x86_64-pc-windows-msvc
+
+      - name: Set up MSVC & Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Set up CMake & Ninja
+        uses: lukka/get-cmake@latest
+
+      - name: Build Rust Static Library
+        working-directory: plug.app/rt
+        run: cargo build --release --lib --target x86_64-pc-windows-msvc
+
+      - name: Build WASM Plugins
+        shell: bash
+        run: |
+          mkdir -p release_pkg
+          mkdir -p release_pkg/plugins
+          rustc --target wasm32-unknown-unknown --crate-type cdylib plug.app/rt/src_plugins/pTerm/pTerm.rs -o release_pkg/plugins/pTerm.wasm -C opt-level=z -C lto=true -C link-arg=--allow-undefined
+          cp plug.app/rt/src_plugins/plugin.toml release_pkg/plugins/plugin.toml
+
+      - name: Run CMake Configuration
+        run: |
+          cmake -G Ninja -S plug.cross/windows -B plug.cross/windows/build "-DRUST_LIB_PATH=${{ github.workspace }}/plug.app/rt/target/x86_64-pc-windows-msvc/release/tm_main.lib" -DCOMPILE_RUST_CORE=OFF -DCMAKE_BUILD_TYPE=Release
+
+
+      - name: Compile plugxel executable
+        run: |
+          cmake --build plug.cross/windows/build
+
+      - name: Prepare Package
+        run: |
+          cp plug.cross/windows/build/plugxel.exe release_pkg/plugxel.exe
+          cp LICENSE release_pkg/LICENSE
+          cp README.md release_pkg/README.md
+          compress-archive -Path release_pkg/* -DestinationPath plugxel-windows-x64.zip
+
+      - name: Upload Windows Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-asset
+          path: plugxel-windows-x64.zip
+
+  build-linux:
+    name: Build Linux Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install GTK4 Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev pkg-config ninja-build libx11-dev
+
+      - name: Build Rust Static Library
+        working-directory: plug.app/rt
+        run: cargo build --release --lib --target x86_64-unknown-linux-gnu
+
+      - name: Build WASM Plugins
+        run: |
+          mkdir -p release_pkg/plugins
+          rustc --target wasm32-unknown-unknown --crate-type cdylib plug.app/rt/src_plugins/pTerm/pTerm.rs -o release_pkg/plugins/pTerm.wasm -C opt-level=z -C lto=true -C link-arg=--allow-undefined
+          cp plug.app/rt/src_plugins/plugin.toml release_pkg/plugins/plugin.toml
+
+      - name: Run CMake Configuration
+        run: |
+          cmake -G Ninja -S plug.cross/linux -B plug.cross/linux/build "-DRUST_LIB_PATH=${{ github.workspace }}/plug.app/rt/target/x86_64-unknown-linux-gnu/release/libtm_main.a" -DCMAKE_BUILD_TYPE=Release
+
+      - name: Compile plugxel executable
+        run: |
+          cmake --build plug.cross/linux/build
+
+      - name: Prepare Package
+        run: |
+          cp plug.cross/linux/build/plugxel release_pkg/plugxel
+          cp LICENSE release_pkg/LICENSE
+          cp README.md release_pkg/README.md
+          zip -r plugxel-linux-x64.zip release_pkg/*
+
+      - name: Upload Linux Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-asset
+          path: plugxel-linux-x64.zip
+
+  publish-release:
+    name: Publish Release to GitHub
+    runs-on: ubuntu-latest
+    needs: [build-windows, build-linux]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download Windows Asset
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-asset
+
+      - name: Download Linux Asset
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-asset
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          prerelease: false
+          files: |
+            plugxel-windows-x64.zip
+            plugxel-linux-x64.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

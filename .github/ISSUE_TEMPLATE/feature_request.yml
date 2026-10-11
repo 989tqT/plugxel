@@ -1,0 +1,27 @@
+name: "Feature Request"
+description: "Suggest an idea or improvement for the plug framework."
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: "Problem / Goal Description"
+      description: "Explain the problem you want to solve or the goal you want to achieve."
+      placeholder: "e.g., I find it difficult to..."
+    validations:
+      required: true
+  - type: textarea
+    id: design
+    attributes:
+      label: "Proposed Design / Behavior"
+      description: "Describe how you envision the feature working."
+      placeholder: "e.g., We could add a new command..."
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: "Alternatives Considered"
+      description: "Describe any workarounds or alternative solutions you have considered."
+    validations:
+      required: false

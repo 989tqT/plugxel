@@ -1,0 +1,57 @@
+{
+    "active_toolchain": "gcc-x64",
+    "toolchains": {
+        "gcc-x64": {
+            "arch": "x64",
+            "bin_path": "/usr/bin",
+            "rust_target": "x86_64-unknown-linux-gnu",
+            "c_compiler": "gcc",
+            "cxx_compiler": "g++",
+            "extra_flags": ""
+        },
+        "gcc-x86": {
+            "arch": "x86",
+            "bin_path": "/usr/bin",
+            "rust_target": "i686-unknown-linux-gnu",
+            "c_compiler": "gcc",
+            "cxx_compiler": "g++",
+            "extra_flags": "-m32"
+        },
+        "clang-x64": {
+            "arch": "x64",
+            "bin_path": "/usr/bin",
+            "rust_target": "x86_64-unknown-linux-gnu",
+            "c_compiler": "clang",
+            "cxx_compiler": "clang++",
+            "extra_flags": "-fuse-ld=lld"
+        },
+        "clang-x86": {
+            "arch": "x86",
+            "bin_path": "/usr/bin",
+            "rust_target": "i686-unknown-linux-gnu",
+            "c_compiler": "clang",
+            "cxx_compiler": "clang++",
+            "extra_flags": "-m32 -fuse-ld=lld"
+        },
+        "clang-arm64": {
+            "arch": "arm64",
+            "bin_path": "/usr/bin",
+            "rust_target": "aarch64-unknown-linux-gnu",
+            "c_compiler": "clang",
+            "cxx_compiler": "clang++",
+            "extra_flags": "--target=aarch64-linux-gnu -fuse-ld=lld"
+        }
+    },
+    "tools": {
+        "cmake": "cmake",
+        "ninja": "ninja",
+        "cargo": "cargo",
+        "rustc": "rustc",
+        "upx": "upx"
+    },
+    "build_options": {
+        "hide_console": false,
+        "upx_compress": true,
+        "upx_level": "--best --lzma"
+    }
+}

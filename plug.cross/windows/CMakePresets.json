@@ -1,0 +1,31 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "windows-msvc-release",
+      "displayName": "Windows x64 Release (MSVC)",
+      "description": "Target Windows x64 using MSVC Compiler",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "RUST_LIB_PATH": "${sourceDir}/../../plug.app/rt/target/x86_64-pc-windows-msvc/release/tm_main.lib",
+        "HIDE_CONSOLE": "ON",
+        "COMPILE_RUST_CORE": "ON"
+      }
+    },
+    {
+      "name": "windows-msvc-debug",
+      "displayName": "Windows x64 Debug (MSVC)",
+      "description": "Target Windows x64 Debug using MSVC Compiler",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "RUST_LIB_PATH": "${sourceDir}/../../plug.app/rt/target/x86_64-pc-windows-msvc/debug/tm_main.lib",
+        "HIDE_CONSOLE": "OFF",
+        "COMPILE_RUST_CORE": "ON"
+      }
+    }
+  ]
+}

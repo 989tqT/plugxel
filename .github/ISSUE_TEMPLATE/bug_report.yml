@@ -1,0 +1,45 @@
+name: "Bug Report"
+description: "Report a bug or anomalous behavior in the plug runtime or interface."
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: platform
+    attributes:
+      label: "Platform"
+      description: "Select the operating system where the bug was observed."
+      options:
+        - "Windows"
+        - "Linux"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: "Plug Version / Commit Hash"
+      placeholder: "e.g., vx.x.xx or <git-commit-hash>"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: "Steps to Reproduce"
+      description: "Provide a detailed step-by-step description of how to reproduce the bug."
+      placeholder: "1. Run plug...\n2. Install plugin...\n3. Open and run..."
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: "Expected vs Actual Behavior"
+      description: "Explain what you expected to happen versus what actually occurred."
+      placeholder: "Expected: ...\nActual: ..."
+    validations:
+      required: true
+  - type: textarea
+    id: plugin
+    attributes:
+      label: "Relevant Plugin (If Applicable)"
+      description: "If this issue is related to a specific WebAssembly plugin, specify its name and version."
+      placeholder: "e.g., plugin vx.x.x"
+    validations:
+      required: false 

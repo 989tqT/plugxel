@@ -32,7 +32,7 @@ To distinguish target environment mismatches from code failures, `preflight.py` 
 - **Version Ranges**: Checks that `cargo` is present and reports the configured minimum cargo version from `preflight.py`.
 - **Zero-Dependency Path-Based Orphan Cleanup**:
   - To avoid installing third-party Python modules like `psutil` in CI/dev setups, path lookup uses native command utilities.
-  - **Windows**: Invokes `powershell "Get-Process plugxel -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Path"` to retrieve the executable path of matching active processes.
+  - **Windows**: Invokes `powershell "Get-Process plugxelxel -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Path"` to retrieve the executable path of matching active processes.
   - **Linux**: Reads `/proc/<pid>/exe` using `os.readlink()` for processes owned by the current user.
   - If a process matches the exact absolute target path of our compiled build binary in the workspace, it is terminated.
 - **OS Mapping**: Detects hosting environment parameters (`platform.system()`) to assign OS-specific configurations:

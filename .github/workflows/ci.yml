@@ -90,7 +90,7 @@ jobs:
             -DCOMPILE_RUST_CORE=OFF \
             -DCMAKE_BUILD_TYPE=Release \
             -DHIDE_CONSOLE=ON \
-            -DPLUGXEL_ENABLE_HEADLESS_MODE=OFF -DPLUG_ENABLE_HEADLESS_MODE=OFF
+            -DPLUGXEL_ENABLE_HEADLESS_MODE=OFF -DPLUGXEL_ENABLE_HEADLESS_MODE=OFF -DPLUG_ENABLE_HEADLESS_MODE=OFF
 
       - name: Compile plugxel executable
         run: |
@@ -131,7 +131,7 @@ jobs:
 
       - name: Run CMake Configuration
         run: |
-          cmake -G Ninja -S plug.cross/linux -B plug.cross/linux/build "-DRUST_LIB_PATH=${{ github.workspace }}/plug.app/rt/target/x86_64-unknown-linux-gnu/release/libtm_main.a" -DCMAKE_BUILD_TYPE=Release -DPLUGXEL_ENABLE_HEADLESS_MODE=ON -DPLUG_ENABLE_HEADLESS_MODE=ON
+          cmake -G Ninja -S plug.cross/linux -B plug.cross/linux/build "-DRUST_LIB_PATH=${{ github.workspace }}/plug.app/rt/target/x86_64-unknown-linux-gnu/release/libtm_main.a" -DCMAKE_BUILD_TYPE=Release -DPLUGXEL_ENABLE_HEADLESS_MODE=ON -DPLUGXEL_ENABLE_HEADLESS_MODE=ON -DPLUG_ENABLE_HEADLESS_MODE=ON
 
       - name: Compile plugxel executable
         run: |

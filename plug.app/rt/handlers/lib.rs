@@ -5,6 +5,9 @@ pub mod ops {
     pub mod utils;
     pub mod host;
     pub mod net;
+    // isolate experimental containment spike to test builds
+    #[cfg(test)]
+    pub mod fs_containment;
 }
 
 #[cfg(test)]

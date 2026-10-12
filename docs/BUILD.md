@@ -1,4 +1,4 @@
-# Building plugxel
+# Building plugxelxel
 
 ## Toolchain Prerequisites
 

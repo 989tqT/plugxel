@@ -1,5 +1,22 @@
 # Changelog
 
+---
+
+## [Unreleased]
+
+### Added
+
+- Added an experimental P1.5 Linux filesystem-containment spike using `openat2()` with `RESOLVE_BENEATH`, `RESOLVE_NO_MAGICLINKS`, and `RESOLVE_NO_SYMLINKS`; directory mutations use safely opened parent descriptors with single-component `mkdirat()` and `unlinkat()`. The spike remains isolated from the production runtime.
+- Added a reproducible standalone Linux containment runner and acceptance tests covering scoped access, traversal and symlink rejection, pinned-parent mutations, outside-sentinel integrity, concurrent namespace mutation, retry exhaustion, and fail-closed behavior when `openat2` is unavailable.
+- Added an experimental P1.5 Windows filesystem-containment feasibility spike using native `NtCreateFile` with parent `RootDirectory` handle walking, single-component lexical validation, `FILE_OPEN_REPARSE_POINT` junction rejection, fail-closed hard-link policy (`NumberOfLinks > 1`), deterministic truncate positioning, and handle-directed atomic deletions via `SetFileInformationByHandle`. The spike remains isolated from the production runtime.
+
+### Fixed
+
+- Corrected WASI Preview 1 errno constants and Linux-to-WASI error mappings, including `EIO = 29` and `EISDIR = 31`.
+- Added deterministic regression tests for `EAGAIN` retry exhaustion (one initial attempt plus three retries) and `ENOSYS` fail-closed behavior.
+
+---
+
 ## [0.1.2a] - 2026-10-08
 
 ### Fixed

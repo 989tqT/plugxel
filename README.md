@@ -60,7 +60,7 @@ cd plug.cross/linux && ./make.sh
 | `/plug-` | `[hash]` | Unloads the specified plugin. |
 | `/e` | None | Exits the application. |
 
-> See [All plugins command reference](docs/PLUGINS/README.md) for details.
+> See [All plugins command reference](docs/plugins/README.md) for details.
 
 ---
 

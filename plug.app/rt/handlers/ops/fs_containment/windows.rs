@@ -68,6 +68,10 @@ const OBJ_CASE_INSENSITIVE: u32 = 0x00000040;
 
 // file info class
 const FILE_DISPOSITION_INFO_CLASS: u32 = 4;
+const FILE_CASE_SENSITIVE_INFO_CLASS: u32 = 71;
+
+// case sensitivity flag
+const FILE_CS_FLAG_CASE_SENSITIVE_DIR: u32 = 0x00000001;
 
 #[repr(C)]
 struct UnicodeString {
@@ -87,9 +91,10 @@ struct ObjectAttributes {
 }
 
 #[repr(C)]
-struct IoStatusBlock {
-    status: i32,
-    information: usize,
+#[derive(Debug, Clone, Copy)]
+pub struct IoStatusBlock {
+    pub status: i32,
+    pub information: usize,
 }
 
 #[repr(C)]
@@ -114,6 +119,12 @@ struct FileDispositionInfo {
     delete_file: u8,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileCaseSensitiveInfo {
+    pub flags: u32,
+}
+
 #[link(name = "ntdll")]
 extern "system" {
     fn NtCreateFile(
@@ -131,6 +142,23 @@ extern "system" {
     ) -> i32;
 
     fn NtClose(handle: *mut std::ffi::c_void) -> i32;
+
+    fn NtQueryInformationFile(
+        file_handle: *mut std::ffi::c_void,
+        io_status_block: *mut IoStatusBlock,
+        file_information: *mut std::ffi::c_void,
+        length: u32,
+        file_information_class: u32,
+    ) -> i32;
+
+    #[cfg(test)]
+    fn NtSetInformationFile(
+        file_handle: *mut std::ffi::c_void,
+        io_status_block: *mut IoStatusBlock,
+        file_information: *mut std::ffi::c_void,
+        length: u32,
+        file_information_class: u32,
+    ) -> i32;
 }
 
 extern "system" {
@@ -219,15 +247,109 @@ fn get_canonical_handle_path(handle: *mut std::ffi::c_void) -> Option<PathBuf> {
     Some(p)
 }
 
-// normalize path for comparison with lowercasing and separator canonicalization
-fn normalize_path_for_compare(p: &Path) -> PathBuf {
-    let s = p.to_string_lossy().to_lowercase();
-    let stripped = if let Some(rest) = s.strip_prefix(r"\\?\") {
-        rest
-    } else {
-        &s
+// verify canonical containment using directory boundary aware exact ordinal comparison
+pub fn verify_canonical_containment(root_path: &Path, leaf_path: &Path) -> bool {
+    let root_comps: Vec<_> = root_path.components().collect();
+    let leaf_comps: Vec<_> = leaf_path.components().collect();
+
+    // strict child or self invariant leaf must have at least as many component as root
+    if leaf_comps.len() < root_comps.len() {
+        return false;
+    }
+
+    // exact binary ordinal comparison across all root prefix component
+    for (r, l) in root_comps.iter().zip(leaf_comps.iter()) {
+        if r.as_os_str() != l.as_os_str() {
+            return false;
+        }
+    }
+
+    true
+}
+
+// evaluate nt query information result for case sensitivity with strict fail closed policy
+pub fn evaluate_case_sensitive_info(
+    status: i32,
+    io_status: &IoStatusBlock,
+    info: &FileCaseSensitiveInfo,
+) -> Result<(), i32> {
+    // fail closed on any nt query failure or unsupported information class
+    if status != STATUS_SUCCESS {
+        return Err(WASI_ENOTCAPABLE);
+    }
+
+    // fail closed if io status block indicate error
+    if io_status.status != STATUS_SUCCESS {
+        return Err(WASI_ENOTCAPABLE);
+    }
+
+    // fail closed if buffer size return by kernel is insufficient
+    if io_status.information < std::mem::size_of::<FileCaseSensitiveInfo>() {
+        return Err(WASI_ENOTCAPABLE);
+    }
+
+    // reject directory when case sensitive flag is set
+    if (info.flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR) != 0 {
+        return Err(WASI_ENOTCAPABLE);
+    }
+
+    Ok(())
+}
+
+// query parent directory case sensitivity state and enforce fail closed policy
+pub fn check_parent_case_sensitivity(parent_handle: *mut std::ffi::c_void) -> Result<(), i32> {
+    check_parent_case_sensitivity_with_query(parent_handle, |h, ios, inf, len, cls| unsafe {
+        NtQueryInformationFile(h, ios, inf, len, cls)
+    })
+}
+
+// query parent directory case sensitivity state with query runner seam
+pub fn check_parent_case_sensitivity_with_query<F>(
+    parent_handle: *mut std::ffi::c_void,
+    mut query_fn: F,
+) -> Result<(), i32>
+where
+    F: FnMut(*mut std::ffi::c_void, *mut IoStatusBlock, *mut std::ffi::c_void, u32, u32) -> i32,
+{
+    if parent_handle.is_null() {
+        return Err(WASI_EBADF);
+    }
+
+    let mut info = FileCaseSensitiveInfo { flags: 0xFFFFFFFF };
+    let mut io_status = IoStatusBlock {
+        status: 0,
+        information: 0,
     };
-    PathBuf::from(stripped.replace('/', "\\"))
+
+    let status = query_fn(
+        parent_handle,
+        &mut io_status,
+        &mut info as *mut _ as *mut std::ffi::c_void,
+        std::mem::size_of::<FileCaseSensitiveInfo>() as u32,
+        FILE_CASE_SENSITIVE_INFO_CLASS,
+    );
+
+    evaluate_case_sensitive_info(status, &io_status, &info)
+}
+
+#[cfg(test)]
+pub fn set_directory_case_sensitive(dir_handle: *mut std::ffi::c_void, enable: bool) -> i32 {
+    let mut info = FileCaseSensitiveInfo {
+        flags: if enable { FILE_CS_FLAG_CASE_SENSITIVE_DIR } else { 0 },
+    };
+    let mut io_status = IoStatusBlock {
+        status: 0,
+        information: 0,
+    };
+    unsafe {
+        NtSetInformationFile(
+            dir_handle,
+            &mut io_status,
+            &mut info as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<FileCaseSensitiveInfo>() as u32,
+            FILE_CASE_SENSITIVE_INFO_CLASS,
+        )
+    }
 }
 
 // validate single path component
@@ -274,14 +396,21 @@ pub fn parse_relative_components(rel_path: &str) -> Result<Vec<&str>, i32> {
 }
 
 // open single component relative to verified parent handle via ntcreatefile
-fn open_relative_nt_component(
+fn open_relative_nt_component_with_check<F>(
     parent_handle: *mut std::ffi::c_void,
     component_name: &str,
     desired_access: u32,
     create_disposition: u32,
     create_options: u32,
-) -> Result<*mut std::ffi::c_void, i32> {
+    check_case: &F,
+) -> Result<*mut std::ffi::c_void, i32>
+where
+    F: Fn(*mut std::ffi::c_void) -> Result<(), i32>,
+{
     validate_component_token(component_name)?;
+
+    // pre-open inspection verify parent directory case sensitivity before resolve child
+    check_case(parent_handle)?;
 
     let mut utf16: Vec<u16> = component_name.encode_utf16().collect();
     let length_bytes = (utf16.len() * 2) as u16;
@@ -329,21 +458,51 @@ fn open_relative_nt_component(
     Ok(child_handle)
 }
 
+fn open_relative_nt_component(
+    parent_handle: *mut std::ffi::c_void,
+    component_name: &str,
+    desired_access: u32,
+    create_disposition: u32,
+    create_options: u32,
+) -> Result<*mut std::ffi::c_void, i32> {
+    open_relative_nt_component_with_check(
+        parent_handle,
+        component_name,
+        desired_access,
+        create_disposition,
+        create_options,
+        &check_parent_case_sensitivity,
+    )
+}
+
 // walk parent directory handle chain safely
-fn walk_parent_directory_handles(
+fn walk_parent_directory_handles<F>(
     root_handle: *mut std::ffi::c_void,
     components: &[&str],
-) -> Result<*mut std::ffi::c_void, i32> {
+    check_case: &F,
+) -> Result<*mut std::ffi::c_void, i32>
+where
+    F: Fn(*mut std::ffi::c_void) -> Result<(), i32>,
+{
     let mut current_handle = root_handle;
     let mut handles_to_close: Vec<*mut std::ffi::c_void> = Vec::new();
 
     for comp in components {
-        let child = match open_relative_nt_component(
+        // pre-open inspection verify current parent directory case sensitivity
+        if let Err(e) = check_case(current_handle) {
+            for h in handles_to_close {
+                unsafe { NtClose(h) };
+            }
+            return Err(e);
+        }
+
+        let child = match open_relative_nt_component_with_check(
             current_handle,
             comp,
             FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
             FILE_OPEN,
             FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+            check_case,
         ) {
             Ok(h) => h,
             Err(e) => {
@@ -398,11 +557,36 @@ fn walk_parent_directory_handles(
     }
 }
 
-pub struct WindowsContainmentEngine;
+#[derive(Clone)]
+pub struct WindowsContainmentEngine {
+    #[cfg(test)]
+    case_query_override: Option<std::sync::Arc<dyn Fn(*mut std::ffi::c_void) -> Result<(), i32> + Send + Sync>>,
+}
 
 impl WindowsContainmentEngine {
     pub fn new() -> Self {
-        Self
+        Self {
+            #[cfg(test)]
+            case_query_override: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_with_case_hook<F>(hook: F) -> Self
+    where
+        F: Fn(*mut std::ffi::c_void) -> Result<(), i32> + Send + Sync + 'static,
+    {
+        Self {
+            case_query_override: Some(std::sync::Arc::new(hook)),
+        }
+    }
+
+    fn check_case(&self, handle: *mut std::ffi::c_void) -> Result<(), i32> {
+        #[cfg(test)]
+        if let Some(ref hook) = self.case_query_override {
+            return hook(handle);
+        }
+        check_parent_case_sensitivity(handle)
     }
 }
 
@@ -418,12 +602,35 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
         }
         let root_info = unsafe { root_info.assume_init() };
 
+        // verify root handle itself is directory
+        if root_info.dw_file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(WASI_ENOTDIR);
+        }
+
+        // verify root handle is not reparse point
+        if root_info.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(WASI_ENOTCAPABLE);
+        }
+
+        // pre-open inspection verify root directory case sensitivity before resolve any child
+        self.check_case(root_handle)?;
+
+        let check_fn = |h| self.check_case(h);
+
         let (parent_handle, leaf_name, should_close_parent) = if components.len() == 1 {
             (root_handle, components[0], false)
         } else {
-            let parent = walk_parent_directory_handles(root_handle, &components[..components.len() - 1])?;
+            let parent = walk_parent_directory_handles(root_handle, &components[..components.len() - 1], &check_fn)?;
             (parent, components[components.len() - 1], parent != root_handle)
         };
+
+        // pre-open inspection verify parent handle before resolve leaf component
+        if let Err(e) = self.check_case(parent_handle) {
+            if should_close_parent {
+                unsafe { NtClose(parent_handle) };
+            }
+            return Err(e);
+        }
 
         let (desired_access, create_disposition, create_options) = if flags.directory {
             (
@@ -449,12 +656,13 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
             (acc, disp, FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT)
         };
 
-        let leaf_res = open_relative_nt_component(
+        let leaf_res = open_relative_nt_component_with_check(
             parent_handle,
             leaf_name,
             desired_access,
             create_disposition,
             create_options,
+            &check_fn,
         );
 
         if should_close_parent {
@@ -478,7 +686,7 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
         }
 
         // hard link containment policy check
-        // reject file with multiple hard links to prevent external alias write
+        // reject file with multiple hard link to prevent external alias write
         if !flags.directory && info.n_number_of_links > 1 {
             unsafe { NtClose(leaf_handle) };
             return Err(WASI_ENOTCAPABLE);
@@ -490,12 +698,10 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
             return Err(WASI_ENOTCAPABLE);
         }
 
-        // canonical boundary verification with lowercased path comparison
+        // canonical boundary verification with exact ordinal component comparison
         if let Some(root_path) = get_canonical_handle_path(root_handle) {
             if let Some(leaf_path) = get_canonical_handle_path(leaf_handle) {
-                let norm_root = normalize_path_for_compare(&root_path);
-                let norm_leaf = normalize_path_for_compare(&leaf_path);
-                if !norm_leaf.starts_with(&norm_root) {
+                if !verify_canonical_containment(&root_path, &leaf_path) {
                     unsafe { NtClose(leaf_handle) };
                     return Err(WASI_ENOTCAPABLE);
                 }
@@ -534,19 +740,33 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
         let root_handle = resolve_raw_handle(root_fd)?;
         let components = parse_relative_components(rel_path)?;
 
+        // pre-open inspection verify root directory case sensitivity before resolve any child
+        self.check_case(root_handle)?;
+
+        let check_fn = |h| self.check_case(h);
+
         let (parent_handle, leaf_name, should_close_parent) = if components.len() == 1 {
             (root_handle, components[0], false)
         } else {
-            let parent = walk_parent_directory_handles(root_handle, &components[..components.len() - 1])?;
+            let parent = walk_parent_directory_handles(root_handle, &components[..components.len() - 1], &check_fn)?;
             (parent, components[components.len() - 1], parent != root_handle)
         };
 
-        let res = open_relative_nt_component(
+        // pre-open inspection verify parent handle before resolve leaf component
+        if let Err(e) = self.check_case(parent_handle) {
+            if should_close_parent {
+                unsafe { NtClose(parent_handle) };
+            }
+            return Err(e);
+        }
+
+        let res = open_relative_nt_component_with_check(
             parent_handle,
             leaf_name,
             FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
             FILE_CREATE,
             FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+            &check_fn,
         );
 
         if should_close_parent {
@@ -566,19 +786,33 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
         let root_handle = resolve_raw_handle(root_fd)?;
         let components = parse_relative_components(rel_path)?;
 
+        // pre-open inspection verify root directory case sensitivity before resolve any child
+        self.check_case(root_handle)?;
+
+        let check_fn = |h| self.check_case(h);
+
         let (parent_handle, leaf_name, should_close_parent) = if components.len() == 1 {
             (root_handle, components[0], false)
         } else {
-            let parent = walk_parent_directory_handles(root_handle, &components[..components.len() - 1])?;
+            let parent = walk_parent_directory_handles(root_handle, &components[..components.len() - 1], &check_fn)?;
             (parent, components[components.len() - 1], parent != root_handle)
         };
 
-        let res = open_relative_nt_component(
+        // pre-open inspection verify parent handle before resolve leaf component
+        if let Err(e) = self.check_case(parent_handle) {
+            if should_close_parent {
+                unsafe { NtClose(parent_handle) };
+            }
+            return Err(e);
+        }
+
+        let res = open_relative_nt_component_with_check(
             parent_handle,
             leaf_name,
             DELETE | FILE_READ_ATTRIBUTES,
             FILE_OPEN,
             FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+            &check_fn,
         );
 
         if should_close_parent {
@@ -628,19 +862,33 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
         let root_handle = resolve_raw_handle(root_fd)?;
         let components = parse_relative_components(rel_path)?;
 
+        // pre-open inspection verify root directory case sensitivity before resolve any child
+        self.check_case(root_handle)?;
+
+        let check_fn = |h| self.check_case(h);
+
         let (parent_handle, leaf_name, should_close_parent) = if components.len() == 1 {
             (root_handle, components[0], false)
         } else {
-            let parent = walk_parent_directory_handles(root_handle, &components[..components.len() - 1])?;
+            let parent = walk_parent_directory_handles(root_handle, &components[..components.len() - 1], &check_fn)?;
             (parent, components[components.len() - 1], parent != root_handle)
         };
 
-        let res = open_relative_nt_component(
+        // pre-open inspection verify parent handle before resolve leaf component
+        if let Err(e) = self.check_case(parent_handle) {
+            if should_close_parent {
+                unsafe { NtClose(parent_handle) };
+            }
+            return Err(e);
+        }
+
+        let res = open_relative_nt_component_with_check(
             parent_handle,
             leaf_name,
             DELETE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
             FILE_OPEN,
             FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+            &check_fn,
         );
 
         if should_close_parent {
@@ -966,5 +1214,380 @@ mod tests {
         assert_eq!(std::fs::read(&sentinel_path).unwrap(), b"unmodified stress sentinel");
         let _ = std::fs::remove_file(&sentinel_path);
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_windows_case_sensitive_evaluation_rules() {
+        // test evaluate case sensitive info strict fail closed rule
+        let success_io = IoStatusBlock {
+            status: STATUS_SUCCESS,
+            information: std::mem::size_of::<FileCaseSensitiveInfo>(),
+        };
+
+        // ordinary case insensitive directory succeed
+        let normal_info = FileCaseSensitiveInfo { flags: 0 };
+        assert_eq!(evaluate_case_sensitive_info(STATUS_SUCCESS, &success_io, &normal_info), Ok(()));
+
+        // case sensitive directory flag reject
+        let cs_info = FileCaseSensitiveInfo { flags: FILE_CS_FLAG_CASE_SENSITIVE_DIR };
+        assert_eq!(evaluate_case_sensitive_info(STATUS_SUCCESS, &success_io, &cs_info), Err(WASI_ENOTCAPABLE));
+
+        // multi-flag with bit 0 set reject
+        let multi_flag_info = FileCaseSensitiveInfo { flags: 0x00000003 };
+        assert_eq!(evaluate_case_sensitive_info(STATUS_SUCCESS, &success_io, &multi_flag_info), Err(WASI_ENOTCAPABLE));
+
+        // nt query failure reject
+        assert_eq!(evaluate_case_sensitive_info(STATUS_ACCESS_DENIED, &success_io, &normal_info), Err(WASI_ENOTCAPABLE));
+        assert_eq!(evaluate_case_sensitive_info(-1073741821, &success_io, &normal_info), Err(WASI_ENOTCAPABLE)); // STATUS_INVALID_INFO_CLASS
+        assert_eq!(evaluate_case_sensitive_info(-1073741637, &success_io, &normal_info), Err(WASI_ENOTCAPABLE)); // STATUS_NOT_SUPPORTED
+
+        // io status block failure reject
+        let err_io = IoStatusBlock {
+            status: STATUS_ACCESS_DENIED,
+            information: std::mem::size_of::<FileCaseSensitiveInfo>(),
+        };
+        assert_eq!(evaluate_case_sensitive_info(STATUS_SUCCESS, &err_io, &normal_info), Err(WASI_ENOTCAPABLE));
+
+        // truncated information length reject
+        let trunc_io = IoStatusBlock {
+            status: STATUS_SUCCESS,
+            information: 2,
+        };
+        assert_eq!(evaluate_case_sensitive_info(STATUS_SUCCESS, &trunc_io, &normal_info), Err(WASI_ENOTCAPABLE));
+    }
+
+    #[test]
+    fn test_windows_case_sensitivity_query_real_ntfs() {
+        // test native case sensitivity query on real ntfs fixture
+        let temp_dir = std::env::temp_dir().join(format!("plug_win_cs_real_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+
+        let root_file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x02000000)
+            .open(&temp_dir)
+            .unwrap();
+        let root_handle = root_file.as_raw_handle();
+
+        // real ntfs ordinary directory query succeed
+        let query_res = check_parent_case_sensitivity(root_handle);
+        assert_eq!(query_res, Ok(()));
+
+        // query with null handle fail closed with ebadf
+        assert_eq!(check_parent_case_sensitivity(std::ptr::null_mut()), Err(WASI_EBADF));
+
+        // query with invalid handle fail closed with enotcapable
+        assert_eq!(check_parent_case_sensitivity(!0 as *mut std::ffi::c_void), Err(WASI_ENOTCAPABLE));
+
+        // query with closed handle produce kernel query failure and fail closed with enotcapable
+        let test_bin = temp_dir.join("test_write_only.bin");
+        std::fs::write(&test_bin, b"sample").unwrap();
+        let query_fail_file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&test_bin)
+            .unwrap();
+        let query_fail_handle = query_fail_file.as_raw_handle();
+        unsafe { CloseHandle(query_fail_handle) };
+        std::mem::forget(query_fail_file);
+        assert_eq!(check_parent_case_sensitivity(query_fail_handle), Err(WASI_ENOTCAPABLE));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_windows_case_sensitive_sandbox_root_rejection_fail_closed() {
+        // test case sensitive sandbox root reject before open child
+        let temp_dir = std::env::temp_dir().join(format!("plug_win_cs_root_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let sandbox_dir = temp_dir.join("sandbox");
+        std::fs::create_dir_all(&sandbox_dir).unwrap();
+        let sentinel_file = sandbox_dir.join("sentinel.txt");
+        std::fs::write(&sentinel_file, b"intact root sentinel").unwrap();
+
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+
+        let root_file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x02000000)
+            .open(&sandbox_dir)
+            .unwrap();
+        let root_handle = root_file.as_raw_handle();
+        let root_addr = root_handle as usize;
+        let root_fd = unsafe { _open_osfhandle(root_handle as isize, 0x8000) };
+        assert!(root_fd >= 0);
+
+        // hook simulate case sensitive root directory
+        let engine = WindowsContainmentEngine::new_with_case_hook(move |h| {
+            if h as usize == root_addr {
+                Err(WASI_ENOTCAPABLE)
+            } else {
+                check_parent_case_sensitivity(h)
+            }
+        });
+
+        // case sensitive root reject open with enotcapable
+        let open_flags_create = OpenFlags {
+            read: true,
+            write: true,
+            create: true,
+            truncate: false,
+            directory: false,
+            follow_symlinks: false,
+        };
+        let res = engine.open_beneath(root_fd, "new_file.txt", open_flags_create);
+        assert_eq!(res, Err(WASI_ENOTCAPABLE));
+
+        // verify zero unintended file create
+        assert!(!sandbox_dir.join("new_file.txt").exists());
+
+        // case sensitive root reject mkdir with enotcapable
+        let mkdir_res = engine.mkdir_beneath(root_fd, "new_sub_dir");
+        assert_eq!(mkdir_res, Err(WASI_ENOTCAPABLE));
+
+        // verify zero unintended directory create
+        assert!(!sandbox_dir.join("new_sub_dir").exists());
+
+        // case sensitive root reject unlink with enotcapable
+        let unlink_res = engine.unlink_file_beneath(root_fd, "sentinel.txt");
+        assert_eq!(unlink_res, Err(WASI_ENOTCAPABLE));
+
+        // verify pre-existing file intact
+        assert_eq!(std::fs::read(&sentinel_file).unwrap(), b"intact root sentinel");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_windows_case_sensitive_intermediate_parent_rejection() {
+        // test case sensitive intermediate parent reject before open child
+        let temp_dir = std::env::temp_dir().join(format!("plug_win_cs_inter_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let sandbox_dir = temp_dir.join("sandbox");
+        let parent_dir = sandbox_dir.join("intermediate");
+        std::fs::create_dir_all(&parent_dir).unwrap();
+
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+
+        let root_file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x02000000)
+            .open(&sandbox_dir)
+            .unwrap();
+        let root_handle = root_file.as_raw_handle();
+        let root_addr = root_handle as usize;
+        let root_fd = unsafe { _open_osfhandle(root_handle as isize, 0x8000) };
+        assert!(root_fd >= 0);
+
+        // hook permit root but reject intermediate directory
+        let engine = WindowsContainmentEngine::new_with_case_hook(move |h| {
+            if h as usize == root_addr {
+                Ok(())
+            } else {
+                Err(WASI_ENOTCAPABLE)
+            }
+        });
+
+        // case sensitive intermediate parent reject file open
+        let open_flags_create = OpenFlags {
+            read: true,
+            write: true,
+            create: true,
+            truncate: false,
+            directory: false,
+            follow_symlinks: false,
+        };
+        let res = engine.open_beneath(root_fd, "intermediate/blocked_child.txt", open_flags_create);
+        assert_eq!(res, Err(WASI_ENOTCAPABLE));
+
+        // verify zero unintended file create in intermediate directory
+        assert!(!parent_dir.join("blocked_child.txt").exists());
+
+        // case sensitive intermediate parent reject mkdir
+        let mkdir_res = engine.mkdir_beneath(root_fd, "intermediate/blocked_sub");
+        assert_eq!(mkdir_res, Err(WASI_ENOTCAPABLE));
+
+        // verify zero unintended directory create in intermediate directory
+        assert!(!parent_dir.join("blocked_sub").exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_windows_case_sensitivity_query_failure_fail_closed() {
+        // test query failure produce fail closed behavior
+        let temp_dir = std::env::temp_dir().join(format!("plug_win_cs_fail_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let sandbox_dir = temp_dir.join("sandbox");
+        let intermediate_dir = sandbox_dir.join("sub");
+        std::fs::create_dir_all(&intermediate_dir).unwrap();
+
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+
+        let root_file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x02000000)
+            .open(&sandbox_dir)
+            .unwrap();
+        let root_handle = root_file.as_raw_handle();
+        let root_addr = root_handle as usize;
+        let root_fd = unsafe { _open_osfhandle(root_handle as isize, 0x8000) };
+        assert!(root_fd >= 0);
+
+        // hook simulate query failure on intermediate handle
+        let engine = WindowsContainmentEngine::new_with_case_hook(move |h| {
+            if h as usize == root_addr {
+                Ok(())
+            } else {
+                // simulate ntqueryinformationfile failure e.g. status_invalid_info_class
+                Err(WASI_ENOTCAPABLE)
+            }
+        });
+
+        // query failure fail closed with enotcapable
+        let res = engine.open_beneath(root_fd, "sub/target.txt", OpenFlags { create: true, write: true, ..OpenFlags::default() });
+        assert_eq!(res, Err(WASI_ENOTCAPABLE));
+        assert!(!intermediate_dir.join("target.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_windows_real_ntfs_case_sensitive_attribute_gating() {
+        // test real ntfs case sensitive root and intermediate parent gating
+        let temp_dir = std::env::temp_dir().join(format!("plug_win_cs_attr_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let cs_root_dir = temp_dir.join("cs_root");
+        std::fs::create_dir_all(&cs_root_dir).unwrap();
+
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+
+        let root_dir_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(0x02000000)
+            .open(&cs_root_dir)
+            .unwrap();
+        let root_dir_handle = root_dir_file.as_raw_handle();
+
+        // attempt enable case sensitive attribute on real ntfs directory
+        let status = set_directory_case_sensitive(root_dir_handle, true);
+        println!("[NTFS CASE SENSITIVE FIXTURE] NtSetInformationFile status: 0x{:08X}", status);
+
+        if status == STATUS_SUCCESS {
+            // test 1: real case sensitive root rejection
+            let root_fd = unsafe { _open_osfhandle(root_dir_handle as isize, 0x8000) };
+            assert!(root_fd >= 0);
+
+            let engine = WindowsContainmentEngine::new();
+            let open_flags_create = OpenFlags {
+                read: true,
+                write: true,
+                create: true,
+                truncate: false,
+                directory: false,
+                follow_symlinks: false,
+            };
+
+            // real case sensitive root reject open with enotcapable
+            let res = engine.open_beneath(root_fd, "new_file.txt", open_flags_create);
+            assert_eq!(res, Err(WASI_ENOTCAPABLE));
+            // verify zero unintended file create in real case sensitive root
+            assert!(!cs_root_dir.join("new_file.txt").exists());
+
+            // real case sensitive root reject mkdir with enotcapable
+            let res_mkdir = engine.mkdir_beneath(root_fd, "sub_dir");
+            assert_eq!(res_mkdir, Err(WASI_ENOTCAPABLE));
+            // verify zero unintended directory create in real case sensitive root
+            assert!(!cs_root_dir.join("sub_dir").exists());
+
+            // test 2: real case sensitive intermediate parent rejection
+            let norm_sandbox = temp_dir.join("norm_sandbox");
+            let cs_inter_dir = norm_sandbox.join("cs_inter");
+            std::fs::create_dir_all(&cs_inter_dir).unwrap();
+
+            let inter_file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(0x02000000)
+                .open(&cs_inter_dir)
+                .unwrap();
+            let inter_handle = inter_file.as_raw_handle();
+            let inter_status = set_directory_case_sensitive(inter_handle, true);
+            assert_eq!(inter_status, STATUS_SUCCESS);
+
+            let norm_root_file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(0x02000000)
+                .open(&norm_sandbox)
+                .unwrap();
+            let norm_root_handle = norm_root_file.as_raw_handle();
+            let norm_root_fd = unsafe { _open_osfhandle(norm_root_handle as isize, 0x8000) };
+            assert!(norm_root_fd >= 0);
+
+            // real case sensitive intermediate parent reject open with enotcapable
+            let res_inter = engine.open_beneath(norm_root_fd, "cs_inter/blocked.txt", open_flags_create);
+            assert_eq!(res_inter, Err(WASI_ENOTCAPABLE));
+            // verify zero unintended file create in real case sensitive parent
+            assert!(!cs_inter_dir.join("blocked.txt").exists());
+
+            // real case sensitive intermediate parent reject mkdir with enotcapable
+            let res_inter_mkdir = engine.mkdir_beneath(norm_root_fd, "cs_inter/blocked_sub");
+            assert_eq!(res_inter_mkdir, Err(WASI_ENOTCAPABLE));
+            // verify zero unintended directory create in real case sensitive parent
+            assert!(!cs_inter_dir.join("blocked_sub").exists());
+
+            // cleanup case sensitive flag on real ntfs directory
+            let _ = set_directory_case_sensitive(root_dir_handle, false);
+            let _ = set_directory_case_sensitive(inter_handle, false);
+        } else {
+            // report unsupported test environment when privilege missing
+            println!(
+                "[UNSUPPORTED ENVIRONMENT] real NTFS case-sensitive attribute could not be set: status 0x{:08X} (requires administrator privileges or developer mode policy)",
+                status
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_windows_canonical_ordinal_containment() {
+        // test canonical path exact ordinal containment verification
+        let root = Path::new(r"C:\sandbox\data");
+
+        // exact identical match valid
+        assert!(verify_canonical_containment(root, Path::new(r"C:\sandbox\data")));
+
+        // child beneath root valid
+        assert!(verify_canonical_containment(root, Path::new(r"C:\sandbox\data\file.txt")));
+        assert!(verify_canonical_containment(root, Path::new(r"C:\sandbox\data\sub\leaf.bin")));
+
+        // traversal above root reject
+        assert!(!verify_canonical_containment(root, Path::new(r"C:\sandbox")));
+        assert!(!verify_canonical_containment(root, Path::new(r"C:\")));
+
+        // sibling directory prefix collision reject
+        assert!(!verify_canonical_containment(root, Path::new(r"C:\sandbox\data-evil\file.txt")));
+        assert!(!verify_canonical_containment(root, Path::new(r"C:\sandbox\database\file.txt")));
+
+        // ancestor casing divergence reject under exact ordinal policy
+        assert!(!verify_canonical_containment(Path::new(r"C:\Sandbox\data"), Path::new(r"C:\sandbox\data\file.txt")));
+        assert!(!verify_canonical_containment(root, Path::new(r"C:\sandbox\DATA\file.txt")));
     }
 }

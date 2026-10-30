@@ -17,6 +17,7 @@ pub const WASI_EIO: i32 = 29;
 pub const WASI_EISCONN: i32 = 30;
 pub const WASI_EISDIR: i32 = 31;
 pub const WASI_ELOOP: i32 = 32;
+pub const WASI_EMFILE: i32 = 33;
 pub const WASI_ENOENT: i32 = 44;
 pub const WASI_ENOSYS: i32 = 52;
 pub const WASI_ENOTDIR: i32 = 54;
@@ -303,6 +304,25 @@ pub struct DescriptorRights {
 }
 
 impl DescriptorRights {
+    pub const PACKED_INHERITING_SHIFT: u32 = 29;
+
+    // pack 29 bit base and 29 bit inheriting mask into single 64 bit word
+    // guarantee coherent atomic snapshot without torn base or inheriting state
+    pub const fn to_packed_u64(self) -> u64 {
+        (self.base.0 & WasiRights::ALL_VALID)
+            | ((self.inheriting.0 & WasiRights::ALL_VALID) << Self::PACKED_INHERITING_SHIFT)
+    }
+
+    // unpack coherent base and inheriting right snapshot from single 64 bit word
+    pub const fn from_packed_u64(packed: u64) -> Self {
+        Self {
+            base: WasiRights(packed & WasiRights::ALL_VALID),
+            inheriting: WasiRights(
+                (packed >> Self::PACKED_INHERITING_SHIFT) & WasiRights::ALL_VALID,
+            ),
+        }
+    }
+
     // default capability right for preopened sandbox root directory
     pub const fn preopen_directory_default() -> Self {
         Self {
@@ -515,10 +535,11 @@ pub enum DescriptorKind {
 }
 
 // runtime descriptor state managed via arc in descriptor table
+// capability right linearize at single packed atomicu64 load on syscall entry
 pub struct DescriptorState {
     kind: DescriptorKind,
-    rights: std::sync::Mutex<DescriptorRights>,
-    fd_flags: std::sync::Mutex<DescriptorFlags>,
+    packed_rights: std::sync::atomic::AtomicU64,
+    fd_flags: std::sync::atomic::AtomicU16,
 }
 
 impl DescriptorState {
@@ -529,8 +550,10 @@ impl DescriptorState {
                 dir_file,
                 guest_path,
             },
-            rights: std::sync::Mutex::new(DescriptorRights::preopen_directory_default()),
-            fd_flags: std::sync::Mutex::new(DescriptorFlags::EMPTY),
+            packed_rights: std::sync::atomic::AtomicU64::new(
+                DescriptorRights::preopen_directory_default().to_packed_u64(),
+            ),
+            fd_flags: std::sync::atomic::AtomicU16::new(DescriptorFlags::EMPTY.0),
         }
     }
 
@@ -544,8 +567,8 @@ impl DescriptorState {
         let validated_flags = DescriptorFlags::from_raw_validated(fd_flags.0)?;
         Ok(Self {
             kind: DescriptorKind::Directory { dir_file },
-            rights: std::sync::Mutex::new(validated_rights),
-            fd_flags: std::sync::Mutex::new(validated_flags),
+            packed_rights: std::sync::atomic::AtomicU64::new(validated_rights.to_packed_u64()),
+            fd_flags: std::sync::atomic::AtomicU16::new(validated_flags.0),
         })
     }
 
@@ -569,8 +592,8 @@ impl DescriptorState {
                 #[cfg(windows)]
                 file_id,
             },
-            rights: std::sync::Mutex::new(validated_rights),
-            fd_flags: std::sync::Mutex::new(validated_flags),
+            packed_rights: std::sync::atomic::AtomicU64::new(validated_rights.to_packed_u64()),
+            fd_flags: std::sync::atomic::AtomicU16::new(validated_flags.0),
         })
     }
 
@@ -578,17 +601,37 @@ impl DescriptorState {
         &self.kind
     }
 
+    // load coherent base and inheriting right snapshot in single atomic instruction
     pub fn rights(&self) -> DescriptorRights {
-        *self.rights.lock().unwrap_or_else(|e| e.into_inner())
+        DescriptorRights::from_packed_u64(
+            self.packed_rights.load(std::sync::atomic::Ordering::Acquire),
+        )
     }
 
+    // atomically attenuate both base and inheriting right via compare exchange loop
+    // linearize before subsequent syscall entry check while allow in flight io to finish
     pub fn set_rights(&self, new_base_raw: u64, new_inheriting_raw: u64) -> Result<(), WasiErrno> {
-        let mut guard = self.rights.lock().unwrap_or_else(|e| e.into_inner());
-        guard.attenuate(new_base_raw, new_inheriting_raw)
+        use std::sync::atomic::Ordering;
+
+        let mut current_packed = self.packed_rights.load(Ordering::Acquire);
+        loop {
+            let mut candidate = DescriptorRights::from_packed_u64(current_packed);
+            candidate.attenuate(new_base_raw, new_inheriting_raw)?;
+            let next_packed = candidate.to_packed_u64();
+            match self.packed_rights.compare_exchange_weak(
+                current_packed,
+                next_packed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(observed) => current_packed = observed,
+            }
+        }
     }
 
     pub fn fd_flags(&self) -> DescriptorFlags {
-        *self.fd_flags.lock().unwrap_or_else(|e| e.into_inner())
+        DescriptorFlags(self.fd_flags.load(std::sync::atomic::Ordering::Acquire))
     }
 
     pub fn set_fd_flags(&self, new_flags_raw: u16) -> Result<(), WasiErrno> {
@@ -597,9 +640,309 @@ impl DescriptorState {
             return Err(WASI_ENOTCAPABLE);
         }
         let validated = DescriptorFlags::from_raw_validated(new_flags_raw)?;
-        let mut guard = self.fd_flags.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = validated;
+        self.fd_flags
+            .store(validated.0, std::sync::atomic::Ordering::Release);
         Ok(())
+    }
+
+    // snapshot wasi preview 1 fdstat metadata for descriptor
+    pub fn fd_fdstat_get(&self) -> WasiFdstat {
+        let fs_filetype = match &self.kind {
+            DescriptorKind::PreopenDir { .. } | DescriptorKind::Directory { .. } => {
+                WASI_FILETYPE_DIRECTORY
+            }
+            DescriptorKind::RegularFile { .. } => WASI_FILETYPE_REGULAR_FILE,
+        };
+        let rights = self.rights();
+        let fs_flags = self.fd_flags();
+        WasiFdstat {
+            fs_filetype,
+            fs_flags,
+            fs_rights_base: rights.base,
+            fs_rights_inheriting: rights.inheriting,
+        }
+    }
+
+    // seek sequential kernel file pointer under descriptor mutex only
+    pub fn fd_seek(&self, offset: i64, whence: u8) -> Result<u64, WasiErrno> {
+        use std::io::{Seek, SeekFrom};
+
+        let current_rights = self.rights();
+        if !current_rights.base.permits_seek() {
+            return Err(WASI_ENOTCAPABLE);
+        }
+        let file_mutex = match &self.kind {
+            DescriptorKind::RegularFile { file, .. } => file,
+            DescriptorKind::PreopenDir { .. } | DescriptorKind::Directory { .. } => {
+                return Err(WASI_EBADF)
+            }
+        };
+        let seek_from = match whence {
+            0 => {
+                let start = u64::try_from(offset).map_err(|_| WASI_EINVAL)?;
+                SeekFrom::Start(start)
+            }
+            1 => SeekFrom::Current(offset),
+            2 => SeekFrom::End(offset),
+            _ => return Err(WASI_EINVAL),
+        };
+        let mut guard = file_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        guard.seek(seek_from).map_err(|_| WASI_EINVAL)
+    }
+
+    // query sequential kernel file pointer under descriptor mutex only
+    pub fn fd_tell(&self) -> Result<u64, WasiErrno> {
+        use std::io::Seek;
+
+        let current_rights = self.rights();
+        if !current_rights.base.permits_tell() {
+            return Err(WASI_ENOTCAPABLE);
+        }
+        let file_mutex = match &self.kind {
+            DescriptorKind::RegularFile { file, .. } => file,
+            DescriptorKind::PreopenDir { .. } | DescriptorKind::Directory { .. } => {
+                return Err(WASI_EBADF)
+            }
+        };
+        let mut guard = file_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        guard.stream_position().map_err(|_| WASI_EIO)
+    }
+
+    // execute sequential read closure under shared file lock then descriptor mutex
+    pub fn read_with_lock<F, R>(&self, ctx: &RuntimeFsContext, f: F) -> Result<R, WasiErrno>
+    where
+        F: FnOnce(&mut std::fs::File) -> Result<R, WasiErrno>,
+    {
+        let current_rights = self.rights();
+        if !current_rights.base.permits_read() {
+            return Err(WASI_ENOTCAPABLE);
+        }
+        match &self.kind {
+            DescriptorKind::RegularFile {
+                file,
+                #[cfg(windows)]
+                file_id,
+            } => {
+                #[cfg(windows)]
+                {
+                    ctx.file_lock_table().with_shared_lock(*file_id, || {
+                        let mut guard = file.lock().unwrap_or_else(|e| e.into_inner());
+                        f(&mut guard)
+                    })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = ctx;
+                    let mut guard = file.lock().unwrap_or_else(|e| e.into_inner());
+                    f(&mut guard)
+                }
+            }
+            DescriptorKind::PreopenDir { .. } | DescriptorKind::Directory { .. } => {
+                Err(WASI_EBADF)
+            }
+        }
+    }
+
+    // execute sequential write closure under exclusive file lock then descriptor mutex
+    pub fn write_with_lock<F, R>(&self, ctx: &RuntimeFsContext, f: F) -> Result<R, WasiErrno>
+    where
+        F: FnOnce(&mut std::fs::File) -> Result<R, WasiErrno>,
+    {
+        let current_rights = self.rights();
+        if !current_rights.base.permits_write() {
+            return Err(WASI_ENOTCAPABLE);
+        }
+        match &self.kind {
+            DescriptorKind::RegularFile {
+                file,
+                #[cfg(windows)]
+                file_id,
+            } => {
+                #[cfg(windows)]
+                {
+                    ctx.file_lock_table().with_exclusive_lock(*file_id, || {
+                        let mut guard = file.lock().unwrap_or_else(|e| e.into_inner());
+                        f(&mut guard)
+                    })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = ctx;
+                    let mut guard = file.lock().unwrap_or_else(|e| e.into_inner());
+                    f(&mut guard)
+                }
+            }
+            DescriptorKind::PreopenDir { .. } | DescriptorKind::Directory { .. } => {
+                Err(WASI_EBADF)
+            }
+        }
+    }
+
+    // resize file under exclusive file lock then descriptor mutex
+    pub fn set_size_with_lock(&self, ctx: &RuntimeFsContext, size: u64) -> Result<(), WasiErrno> {
+        let current_rights = self.rights();
+        if !current_rights.base.permits_filestat_set_size() {
+            return Err(WASI_ENOTCAPABLE);
+        }
+        match &self.kind {
+            DescriptorKind::RegularFile {
+                file,
+                #[cfg(windows)]
+                file_id,
+            } => {
+                #[cfg(windows)]
+                {
+                    ctx.file_lock_table().with_exclusive_lock(*file_id, || {
+                        let guard = file.lock().unwrap_or_else(|e| e.into_inner());
+                        windows::set_file_end_of_file_unlocked(&guard, size)
+                    })
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = ctx;
+                    let guard = file.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.set_len(size).map_err(|_| WASI_EIO)
+                }
+            }
+            DescriptorKind::PreopenDir { .. } | DescriptorKind::Directory { .. } => {
+                Err(WASI_EBADF)
+            }
+        }
+    }
+}
+
+// wasi preview 1 filetype constant
+pub const WASI_FILETYPE_DIRECTORY: u8 = 3;
+pub const WASI_FILETYPE_REGULAR_FILE: u8 = 4;
+
+// wasi preview 1 fdstat snapshot structure
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WasiFdstat {
+    pub fs_filetype: u8,
+    pub fs_flags: DescriptorFlags,
+    pub fs_rights_base: WasiRights,
+    pub fs_rights_inheriting: WasiRights,
+}
+
+impl WasiFdstat {
+    // serialize into 24 byte wasi preview 1 fdstat binary layout
+    pub const fn to_wasi_bytes(self) -> [u8; 24] {
+        let mut buf = [0u8; 24];
+        buf[0] = self.fs_filetype;
+        let flags_le = self.fs_flags.0.to_le_bytes();
+        buf[2] = flags_le[0];
+        buf[3] = flags_le[1];
+        let base_le = self.fs_rights_base.0.to_le_bytes();
+        buf[8] = base_le[0];
+        buf[9] = base_le[1];
+        buf[10] = base_le[2];
+        buf[11] = base_le[3];
+        buf[12] = base_le[4];
+        buf[13] = base_le[5];
+        buf[14] = base_le[6];
+        buf[15] = base_le[7];
+        let inh_le = self.fs_rights_inheriting.0.to_le_bytes();
+        buf[16] = inh_le[0];
+        buf[17] = inh_le[1];
+        buf[18] = inh_le[2];
+        buf[19] = inh_le[3];
+        buf[20] = inh_le[4];
+        buf[21] = inh_le[5];
+        buf[22] = inh_le[6];
+        buf[23] = inh_le[7];
+        buf
+    }
+}
+
+struct DescriptorTableInner {
+    entries: std::collections::HashMap<i32, std::sync::Arc<DescriptorState>>,
+    // monotonic descriptor allocator starting at 4 to prevent aba descriptor id reuse
+    // none indicate descriptor id space is permanently exhausted
+    next_fd: Option<i32>,
+}
+
+// concurrency safe descriptor table enforcing clone arc and release lock immediately invariant
+pub struct DescriptorTable {
+    inner: std::sync::Mutex<DescriptorTableInner>,
+}
+
+impl DescriptorTable {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(DescriptorTableInner {
+                entries: std::collections::HashMap::new(),
+                next_fd: Some(4),
+            }),
+        }
+    }
+
+    // construct table with preopened capability root directory at fd 3
+    pub fn new_with_preopen(dir_file: std::fs::File, guest_path: &'static str) -> Self {
+        let mut entries = std::collections::HashMap::new();
+        entries.insert(
+            3,
+            std::sync::Arc::new(DescriptorState::new_preopen_dir(dir_file, guest_path)),
+        );
+        Self {
+            inner: std::sync::Mutex::new(DescriptorTableInner {
+                entries,
+                next_fd: Some(4),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_start_fd_for_test(start_fd: i32) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(DescriptorTableInner {
+                entries: std::collections::HashMap::new(),
+                next_fd: if start_fd >= 4 { Some(start_fd) } else { None },
+            }),
+        }
+    }
+
+    // allocate monotonic descriptor id without reuse closed id
+    // return wasi_emfile when descriptor id space reach i32 max without wraparound
+    pub fn insert(&self, state: DescriptorState) -> Result<i32, WasiErrno> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let assigned_fd = match guard.next_fd {
+            Some(fd) if fd >= 4 => fd,
+            _ => return Err(WASI_EMFILE),
+        };
+        guard.next_fd = assigned_fd.checked_add(1);
+        guard.entries.insert(assigned_fd, std::sync::Arc::new(state));
+        Ok(assigned_fd)
+    }
+
+    // lookup descriptor and clone arc while release table lock before return
+    pub fn get(&self, fd: i32) -> Result<std::sync::Arc<DescriptorState>, WasiErrno> {
+        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .entries
+            .get(&fd)
+            .map(std::sync::Arc::clone)
+            .ok_or(WASI_EBADF)
+    }
+
+    // remove descriptor from table and drop arc outside table lock
+    // reject closing preopened capability directory fd 3
+    pub fn close(&self, fd: i32) -> Result<(), WasiErrno> {
+        let removed = {
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = guard.entries.get(&fd) {
+                if matches!(existing.kind(), DescriptorKind::PreopenDir { .. }) {
+                    return Err(WASI_ENOTCAPABLE);
+                }
+            }
+            guard.entries.remove(&fd)
+        };
+        match removed {
+            Some(arc_desc) => {
+                drop(arc_desc);
+                Ok(())
+            }
+            None => Err(WASI_EBADF),
+        }
     }
 }
 
@@ -650,6 +993,7 @@ mod tests {
         assert_eq!(WASI_EISCONN, 30);
         assert_eq!(WASI_EISDIR, 31);
         assert_eq!(WASI_ELOOP, 32);
+        assert_eq!(WASI_EMFILE, 33);
         assert_eq!(WASI_ENOENT, 44);
         assert_eq!(WASI_ENOSYS, 52);
         assert_eq!(WASI_ENOTDIR, 54);
@@ -1252,6 +1596,520 @@ mod tests {
 
         drop(file_desc);
         drop(preopen_desc);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_b2_2_descriptor_id_monotonic_non_reuse_and_preopen_protection() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("plug_b22_mono_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        #[cfg(windows)]
+        let root_file = windows::open_directory_for_containment(&temp_dir).unwrap();
+        #[cfg(not(windows))]
+        let root_file = std::fs::File::open(&temp_dir).unwrap();
+
+        let table = DescriptorTable::new_with_preopen(root_file, "/data");
+
+        // preopen capability directory at fd 3 must reject fd_close with enotcapable
+        assert_eq!(table.close(3), Err(WASI_ENOTCAPABLE));
+        assert!(table.get(3).is_ok());
+
+        let file_path = temp_dir.join("mono.bin");
+        std::fs::write(&file_path, b"abc").unwrap();
+
+        let make_reg = || {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&file_path)
+                .unwrap();
+            let rights = DescriptorRights::for_regular_file(WasiRights(
+                WasiRights::FD_READ | WasiRights::FD_WRITE | WasiRights::FD_SEEK,
+            ))
+            .unwrap();
+            DescriptorState::new_regular_file(f, rights, DescriptorFlags::EMPTY).unwrap()
+        };
+
+        let fd4 = table.insert(make_reg()).unwrap();
+        let fd5 = table.insert(make_reg()).unwrap();
+        let fd6 = table.insert(make_reg()).unwrap();
+        assert_eq!((fd4, fd5, fd6), (4, 5, 6));
+
+        // close fd 4 and fd 5 then verify next allocation receive fd 7 without reuse
+        assert_eq!(table.close(4), Ok(()));
+        assert_eq!(table.close(4), Err(WASI_EBADF));
+        assert_eq!(table.get(4).err(), Some(WASI_EBADF));
+        assert_eq!(table.close(5), Ok(()));
+
+        let fd7 = table.insert(make_reg()).unwrap();
+        assert_eq!(fd7, 7);
+        assert_eq!(table.close(6), Ok(()));
+        assert_eq!(table.close(7), Ok(()));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_b2_2_concurrent_fd_close_while_inflight_operation_holds_arc() {
+        use std::io::Write;
+        use std::sync::{Arc, Barrier};
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("plug_b22_close_race_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let ctx = Arc::new(RuntimeFsContext::new());
+        let table = Arc::new(DescriptorTable::new());
+
+        let file_path = temp_dir.join("inflight.bin");
+        std::fs::write(&file_path, b"").unwrap();
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .unwrap();
+        let rights = DescriptorRights::for_regular_file(WasiRights(
+            WasiRights::FD_READ | WasiRights::FD_WRITE | WasiRights::FD_SEEK,
+        ))
+        .unwrap();
+        let fd = table
+            .insert(DescriptorState::new_regular_file(f, rights, DescriptorFlags::EMPTY).unwrap())
+            .unwrap();
+        assert_eq!(fd, 4);
+
+        let bar_acquired = Arc::new(Barrier::new(2));
+        let bar_closed = Arc::new(Barrier::new(2));
+
+        let table_worker = Arc::clone(&table);
+        let ctx_worker = Arc::clone(&ctx);
+        let bar_acq_w = Arc::clone(&bar_acquired);
+        let bar_cls_w = Arc::clone(&bar_closed);
+
+        // worker thread clone arc from table then enter write_with_lock while main thread close fd
+        let worker = std::thread::spawn(move || {
+            let desc = table_worker.get(fd).unwrap();
+            desc.write_with_lock(&ctx_worker, |file_ref| {
+                bar_acq_w.wait();
+                bar_cls_w.wait();
+                file_ref.write_all(b"inflight_payload_survives_close").map_err(|_| WASI_EIO)?;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(desc.fd_tell().unwrap(), 31);
+        });
+
+        // wait until worker hold arc and file lock
+        bar_acquired.wait();
+
+        // close fd 4 while worker operation still in flight
+        assert_eq!(table.close(fd), Ok(()));
+        assert_eq!(table.get(fd).err(), Some(WASI_EBADF));
+
+        // open another descriptor while fd 4 still in flight and verify id is 5 not 4
+        let f2 = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .unwrap();
+        let fd_new = table
+            .insert(DescriptorState::new_regular_file(f2, rights, DescriptorFlags::EMPTY).unwrap())
+            .unwrap();
+        assert_eq!(fd_new, 5);
+
+        // release worker to finish write on cloned arc
+        bar_closed.wait();
+        worker.join().unwrap();
+
+        assert_eq!(table.close(fd_new), Ok(()));
+        #[cfg(windows)]
+        assert_eq!(ctx.file_lock_table().active_entry_count(), 0);
+        assert_eq!(
+            std::fs::read(&file_path).unwrap(),
+            b"inflight_payload_survives_close"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_b2_2_multithreaded_fd_seek_and_fd_tell_on_shared_descriptor() {
+        use std::sync::{Arc, Barrier};
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("plug_b22_seek_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("seek_target.bin");
+        std::fs::write(&file_path, vec![0x42u8; 4096]).unwrap();
+
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .unwrap();
+        let rights = DescriptorRights::for_regular_file(WasiRights(
+            WasiRights::FD_READ | WasiRights::FD_SEEK,
+        ))
+        .unwrap();
+        let desc = Arc::new(
+            DescriptorState::new_regular_file(f, rights, DescriptorFlags::EMPTY).unwrap(),
+        );
+
+        let threads = 4usize;
+        let barrier = Arc::new(Barrier::new(threads));
+        let mut handles = Vec::new();
+
+        for tid in 0..threads {
+            let d = Arc::clone(&desc);
+            let b = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                for step in 0..50u64 {
+                    let target = ((tid as u64) * 128 + step * 8) % 4096;
+                    let pos = d.fd_seek(target as i64, 0).unwrap();
+                    assert_eq!(pos, target);
+                    let told = d.fd_tell().unwrap();
+                    assert!(told <= 4096);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // verify final deterministic seek from start current and end
+        assert_eq!(desc.fd_seek(100, 0).unwrap(), 100);
+        assert_eq!(desc.fd_tell().unwrap(), 100);
+        assert_eq!(desc.fd_seek(28, 1).unwrap(), 128);
+        assert_eq!(desc.fd_tell().unwrap(), 128);
+        assert_eq!(desc.fd_seek(-96, 2).unwrap(), 4000);
+        assert_eq!(desc.fd_tell().unwrap(), 4000);
+        assert_eq!(desc.fd_seek(-10, 0), Err(WASI_EINVAL));
+        assert_eq!(desc.fd_seek(0, 9), Err(WASI_EINVAL));
+
+        drop(desc);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_b2_2_concurrent_fdstat_get_and_monotonic_set_rights() {
+        use std::sync::{Arc, Barrier};
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("plug_b22_fdstat_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("fdstat.bin");
+        std::fs::write(&file_path, b"stat").unwrap();
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .unwrap();
+        let initial_mask = WasiRights::FD_READ
+            | WasiRights::FD_WRITE
+            | WasiRights::FD_SEEK
+            | WasiRights::FD_TELL
+            | WasiRights::FD_FILESTAT_GET
+            | WasiRights::FD_FILESTAT_SET_SIZE;
+        let rights = DescriptorRights::for_regular_file(WasiRights(initial_mask)).unwrap();
+        let desc = Arc::new(
+            DescriptorState::new_regular_file(
+                f,
+                rights,
+                DescriptorFlags(DescriptorFlags::APPEND),
+            )
+            .unwrap(),
+        );
+
+        let barrier = Arc::new(Barrier::new(2));
+        let d_attenuate = Arc::clone(&desc);
+        let b_attenuate = Arc::clone(&barrier);
+
+        let attenuator = std::thread::spawn(move || {
+            b_attenuate.wait();
+            // step 1 drop fd_filestat_set_size
+            let m1 = initial_mask & !WasiRights::FD_FILESTAT_SET_SIZE;
+            d_attenuate.set_rights(m1, 0).unwrap();
+            assert_eq!(d_attenuate.set_rights(initial_mask, 0), Err(WASI_ENOTCAPABLE));
+
+            // step 2 drop fd_write
+            let m2 = m1 & !WasiRights::FD_WRITE;
+            d_attenuate.set_rights(m2, 0).unwrap();
+            assert_eq!(d_attenuate.set_rights(m1, 0), Err(WASI_ENOTCAPABLE));
+        });
+
+        let d_reader = Arc::clone(&desc);
+        let b_reader = Arc::clone(&barrier);
+        let reader = std::thread::spawn(move || {
+            b_reader.wait();
+            let mut saw_write_dropped = false;
+            for _ in 0..200 {
+                let st = d_reader.fd_fdstat_get();
+                assert_eq!(st.fs_filetype, WASI_FILETYPE_REGULAR_FILE);
+                assert_eq!(st.fs_flags, DescriptorFlags(DescriptorFlags::APPEND));
+                assert_eq!(st.fs_rights_inheriting, WasiRights::EMPTY);
+                assert_eq!(st.fs_rights_base.0 & !initial_mask, 0);
+                if !st.fs_rights_base.contains(WasiRights::FD_WRITE) {
+                    saw_write_dropped = true;
+                } else if saw_write_dropped {
+                    panic!("monotonic right violation observed in concurrent fd_fdstat_get");
+                }
+                let raw_bytes = st.to_wasi_bytes();
+                assert_eq!(raw_bytes[0], WASI_FILETYPE_REGULAR_FILE);
+                assert_eq!(
+                    u16::from_le_bytes([raw_bytes[2], raw_bytes[3]]),
+                    DescriptorFlags::APPEND
+                );
+            }
+        });
+
+        attenuator.join().unwrap();
+        reader.join().unwrap();
+
+        let final_st = desc.fd_fdstat_get();
+        assert!(final_st.fs_rights_base.permits_read());
+        assert!(final_st.fs_rights_base.permits_seek());
+        assert!(!final_st.fs_rights_base.permits_write());
+        assert!(!final_st.fs_rights_base.permits_filestat_set_size());
+
+        drop(desc);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_b2_2_lock_ordering_no_deadlock_multi_descriptor_same_file() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::sync::{Arc, Barrier};
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("plug_b22_lock_order_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let ctx = Arc::new(RuntimeFsContext::new());
+        let table = Arc::new(DescriptorTable::new());
+
+        let file_path = temp_dir.join("shared_lock_order.bin");
+        std::fs::write(&file_path, vec![0x11u8; 256]).unwrap();
+
+        let rights = DescriptorRights::for_regular_file(WasiRights(
+            WasiRights::FD_READ
+                | WasiRights::FD_WRITE
+                | WasiRights::FD_SEEK
+                | WasiRights::FD_TELL
+                | WasiRights::FD_FILESTAT_SET_SIZE,
+        ))
+        .unwrap();
+
+        let f_a = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .unwrap();
+        let f_b = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .unwrap();
+
+        let fd_a = table
+            .insert(DescriptorState::new_regular_file(f_a, rights, DescriptorFlags::EMPTY).unwrap())
+            .unwrap();
+        let fd_b = table
+            .insert(DescriptorState::new_regular_file(f_b, rights, DescriptorFlags::EMPTY).unwrap())
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(4));
+        let mut workers = Vec::new();
+
+        for idx in 0..4usize {
+            let t = Arc::clone(&table);
+            let c = Arc::clone(&ctx);
+            let b = Arc::clone(&barrier);
+            let target_fd = if idx % 2 == 0 { fd_a } else { fd_b };
+
+            workers.push(std::thread::spawn(move || {
+                b.wait();
+                for round in 0..50usize {
+                    let desc = t.get(target_fd).unwrap();
+                    match (idx + round) % 4 {
+                        0 => {
+                            desc.write_with_lock(&c, |f| {
+                                f.seek(SeekFrom::Start(0)).map_err(|_| WASI_EIO)?;
+                                f.write_all(&[0x33u8; 128]).map_err(|_| WASI_EIO)?;
+                                Ok(())
+                            })
+                            .unwrap();
+                        }
+                        1 => {
+                            desc.read_with_lock(&c, |f| {
+                                f.seek(SeekFrom::Start(0)).map_err(|_| WASI_EIO)?;
+                                let mut buf = [0u8; 64];
+                                let _ = f.read(&mut buf).map_err(|_| WASI_EIO)?;
+                                Ok(())
+                            })
+                            .unwrap();
+                        }
+                        2 => {
+                            desc.set_size_with_lock(&c, 256).unwrap();
+                        }
+                        _ => {
+                            let _ = desc.fd_seek(0, 0).unwrap();
+                            let _ = desc.fd_tell().unwrap();
+                            let _ = desc.fd_fdstat_get();
+                        }
+                    }
+                }
+            }));
+        }
+
+        for w in workers {
+            w.join().unwrap();
+        }
+
+        assert_eq!(table.close(fd_a), Ok(()));
+        assert_eq!(table.close(fd_b), Ok(()));
+        #[cfg(windows)]
+        assert_eq!(ctx.file_lock_table().active_entry_count(), 0);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_b2_2_packed_atomic_rights_coherent_snapshot_no_torn_read() {
+        use std::sync::{Arc, Barrier};
+
+        // verify 58 bit packing boundary roundtrip for full 29 bit masks
+        let max_pair = DescriptorRights {
+            base: WasiRights(WasiRights::ALL_VALID),
+            inheriting: WasiRights(WasiRights::ALL_VALID),
+        };
+        let packed = max_pair.to_packed_u64();
+        assert_eq!(packed, (1u64 << 58) - 1);
+        assert_eq!(DescriptorRights::from_packed_u64(packed), max_pair);
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("plug_b22_packed_rights_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        #[cfg(windows)]
+        let root_file = windows::open_directory_for_containment(&temp_dir).unwrap();
+        #[cfg(not(windows))]
+        let root_file = std::fs::File::open(&temp_dir).unwrap();
+
+        let dir_desc = Arc::new(DescriptorState::new_preopen_dir(root_file, "/data"));
+
+        let s0 = DescriptorRights::preopen_directory_default();
+        let s1 = DescriptorRights {
+            base: WasiRights(s0.base.0 & !WasiRights::PATH_UNLINK_FILE),
+            inheriting: WasiRights(s0.inheriting.0 & !WasiRights::FD_FILESTAT_SET_SIZE),
+        };
+        let s2 = DescriptorRights {
+            base: WasiRights(s1.base.0 & !WasiRights::PATH_REMOVE_DIRECTORY),
+            inheriting: WasiRights(s1.inheriting.0 & !WasiRights::FD_WRITE),
+        };
+        let s3 = DescriptorRights {
+            base: WasiRights(s2.base.0 & !WasiRights::PATH_CREATE_FILE),
+            inheriting: WasiRights(s2.inheriting.0 & !WasiRights::FD_SEEK),
+        };
+        let valid_states = [s0, s1, s2, s3];
+
+        let barrier = Arc::new(Barrier::new(5));
+        let mut readers = Vec::new();
+
+        for _ in 0..4usize {
+            let d = Arc::clone(&dir_desc);
+            let b = Arc::clone(&barrier);
+            readers.push(std::thread::spawn(move || {
+                b.wait();
+                let mut prev_idx = 0usize;
+                for _ in 0..500usize {
+                    let st = d.fd_fdstat_get();
+                    let observed = DescriptorRights {
+                        base: st.fs_rights_base,
+                        inheriting: st.fs_rights_inheriting,
+                    };
+                    // snapshot must match one exact step and never mix base from step i with inheriting from step j
+                    let idx = valid_states
+                        .iter()
+                        .position(|candidate| *candidate == observed)
+                        .expect("torn base and inheriting right snapshot observed");
+                    assert!(
+                        idx >= prev_idx,
+                        "non monotonic right snapshot progression observed"
+                    );
+                    prev_idx = idx;
+                }
+            }));
+        }
+
+        let d_writer = Arc::clone(&dir_desc);
+        let b_writer = Arc::clone(&barrier);
+        let writer = std::thread::spawn(move || {
+            b_writer.wait();
+            d_writer.set_rights(s1.base.0, s1.inheriting.0).unwrap();
+            d_writer.set_rights(s2.base.0, s2.inheriting.0).unwrap();
+            d_writer.set_rights(s3.base.0, s3.inheriting.0).unwrap();
+        });
+
+        writer.join().unwrap();
+        for r in readers {
+            r.join().unwrap();
+        }
+
+        assert_eq!(dir_desc.rights(), s3);
+        drop(dir_desc);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_b2_2_descriptor_id_exhaustion_near_i32_max_no_wraparound_or_reuse() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("plug_b22_fd_exhaust_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let file_path = temp_dir.join("exhaust.bin");
+        std::fs::write(&file_path, b"x").unwrap();
+
+        let make_reg = || {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&file_path)
+                .unwrap();
+            let rights =
+                DescriptorRights::for_regular_file(WasiRights(WasiRights::FD_READ)).unwrap();
+            DescriptorState::new_regular_file(f, rights, DescriptorFlags::EMPTY).unwrap()
+        };
+
+        let table = DescriptorTable::new_with_start_fd_for_test(i32::MAX - 1);
+
+        let fd_penultimate = table.insert(make_reg()).unwrap();
+        assert_eq!(fd_penultimate, i32::MAX - 1);
+
+        let fd_max = table.insert(make_reg()).unwrap();
+        assert_eq!(fd_max, i32::MAX);
+
+        // id space now exhausted so further allocation must fail with wasi_emfile
+        assert_eq!(table.insert(make_reg()), Err(WASI_EMFILE));
+
+        // closing existing descriptor must not re enable allocation or reuse closed id
+        assert_eq!(table.close(fd_penultimate), Ok(()));
+        assert_eq!(table.insert(make_reg()), Err(WASI_EMFILE));
+
+        assert_eq!(table.close(fd_max), Ok(()));
+        assert_eq!(table.insert(make_reg()), Err(WASI_EMFILE));
+
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

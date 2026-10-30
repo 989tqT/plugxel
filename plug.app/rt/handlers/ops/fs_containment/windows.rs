@@ -707,6 +707,16 @@ fn truncate_verified_handle_to_zero(handle: *mut std::ffi::c_void) -> Result<(),
     set_verified_handle_end_of_file(handle, 0)
 }
 
+// update owned file end of file when caller already hold exclusive file lock and descriptor mutex
+pub(crate) fn set_file_end_of_file_unlocked(file: &std::fs::File, size: u64) -> Result<(), WasiErrno> {
+    use std::os::windows::io::AsRawHandle;
+    let handle = file.as_raw_handle() as *mut std::ffi::c_void;
+    if handle.is_null() || handle as isize == -1 {
+        return Err(WASI_EBADF);
+    }
+    set_verified_handle_end_of_file(handle, size)
+}
+
 // open host directory handle for containment root without follow reparse point
 pub fn open_directory_for_containment(path: &Path) -> Result<std::fs::File, WasiErrno> {
     use std::os::windows::fs::OpenOptionsExt;

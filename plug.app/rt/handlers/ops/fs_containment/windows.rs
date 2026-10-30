@@ -68,6 +68,7 @@ const OBJ_CASE_INSENSITIVE: u32 = 0x00000040;
 
 // file info class
 const FILE_DISPOSITION_INFO_CLASS: u32 = 4;
+const FILE_END_OF_FILE_INFO_CLASS: u32 = 6;
 const FILE_CASE_SENSITIVE_INFO_CLASS: u32 = 71;
 
 // case sensitivity flag
@@ -120,9 +121,102 @@ struct FileDispositionInfo {
 }
 
 #[repr(C)]
+struct FileEndOfFileInfo {
+    end_of_file: i64,
+}
+
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileCaseSensitiveInfo {
     pub flags: u32,
+}
+
+// ntfs file identity key from by handle file information
+// note refs use 128 bit file id and require file id info query in production
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NtfsFileIdentity {
+    pub volume_serial_number: u32,
+    pub file_index_high: u32,
+    pub file_index_low: u32,
+}
+
+impl NtfsFileIdentity {
+    fn from_info(info: &ByHandleFileInformation) -> Self {
+        Self {
+            volume_serial_number: info.dw_volume_serial_number,
+            file_index_high: info.n_file_index_high,
+            file_index_low: info.n_file_index_low,
+        }
+    }
+}
+
+// per file lock table keyed by verified ntfs file identity
+// two level lock structure avoid hold global table lock during io wait
+pub struct FileLockTable {
+    entries: std::sync::Mutex<std::collections::HashMap<NtfsFileIdentity, std::sync::Arc<std::sync::RwLock<()>>>>,
+}
+
+struct LockEntryReleaseGuard<'a> {
+    table: &'a FileLockTable,
+    id: NtfsFileIdentity,
+    handle: Option<std::sync::Arc<std::sync::RwLock<()>>>,
+}
+
+impl<'a> Drop for LockEntryReleaseGuard<'a> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.table.release_lock_handle(self.id, handle);
+        }
+    }
+}
+
+impl FileLockTable {
+    pub fn new() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    // acquire per file lock handle while hold table mutex briefly
+    pub fn acquire_lock_handle(&self, id: NtfsFileIdentity) -> std::sync::Arc<std::sync::RwLock<()>> {
+        let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        std::sync::Arc::clone(
+            map.entry(id)
+                .or_insert_with(|| std::sync::Arc::new(std::sync::RwLock::new(()))),
+        )
+    }
+
+    // release per file lock handle and prune entry only when no other contender exist
+    pub fn release_lock_handle(&self, id: NtfsFileIdentity, handle: std::sync::Arc<std::sync::RwLock<()>>) {
+        let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        drop(handle);
+        if let Some(existing) = map.get(&id) {
+            if std::sync::Arc::strong_count(existing) == 1 {
+                map.remove(&id);
+            }
+        }
+    }
+
+    // execute closure under exclusive per file lock with unwind safe entry release
+    pub fn with_exclusive_lock<F, R>(&self, id: NtfsFileIdentity, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let entry_guard = LockEntryReleaseGuard {
+            table: self,
+            id,
+            handle: Some(self.acquire_lock_handle(id)),
+        };
+        let lock_ref = entry_guard.handle.as_ref().unwrap();
+        let _write_guard = lock_ref.write().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
+
+    // return count of active file identity entry in table
+    pub fn active_entry_count(&self) -> usize {
+        let map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        map.len()
+    }
 }
 
 #[link(name = "ntdll")]
@@ -181,14 +275,14 @@ extern "system" {
         dw_flags: u32,
     ) -> u32;
 
-    fn SetFilePointer(
+    fn WriteFile(
         h_file: *mut std::ffi::c_void,
-        l_distance_to_move: i32,
-        lp_distance_to_move_high: *mut i32,
-        dw_move_method: u32,
-    ) -> u32;
+        lp_buffer: *const std::ffi::c_void,
+        n_number_of_bytes_to_write: u32,
+        lp_number_of_bytes_written: *mut u32,
+        lp_overlapped: *mut std::ffi::c_void,
+    ) -> i32;
 
-    fn SetEndOfFile(h_file: *mut std::ffi::c_void) -> i32;
     fn CloseHandle(h_object: *mut std::ffi::c_void) -> i32;
 }
 
@@ -557,8 +651,40 @@ where
     }
 }
 
+// query verified ntfs file identity from raw handle
+fn query_ntfs_file_identity(handle: *mut std::ffi::c_void) -> Result<NtfsFileIdentity, i32> {
+    if handle.is_null() {
+        return Err(WASI_EBADF);
+    }
+    let mut info = std::mem::MaybeUninit::<ByHandleFileInformation>::uninit();
+    let ok = unsafe { GetFileInformationByHandle(handle, info.as_mut_ptr()) };
+    if ok == 0 {
+        return Err(WASI_EIO);
+    }
+    let info = unsafe { info.assume_init() };
+    Ok(NtfsFileIdentity::from_info(&info))
+}
+
+// truncate verified handle to zero via fileendoffileinfo class under exclusive lock
+fn truncate_verified_handle_to_zero(handle: *mut std::ffi::c_void) -> Result<(), i32> {
+    let mut eof_info = FileEndOfFileInfo { end_of_file: 0 };
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FILE_END_OF_FILE_INFO_CLASS,
+            &mut eof_info as *mut _ as *mut std::ffi::c_void,
+            std::mem::size_of::<FileEndOfFileInfo>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(WASI_EIO);
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct WindowsContainmentEngine {
+    lock_table: std::sync::Arc<FileLockTable>,
     #[cfg(test)]
     case_query_override: Option<std::sync::Arc<dyn Fn(*mut std::ffi::c_void) -> Result<(), i32> + Send + Sync>>,
 }
@@ -566,9 +692,60 @@ pub struct WindowsContainmentEngine {
 impl WindowsContainmentEngine {
     pub fn new() -> Self {
         Self {
+            lock_table: std::sync::Arc::new(FileLockTable::new()),
             #[cfg(test)]
             case_query_override: None,
         }
+    }
+
+    pub fn lock_table(&self) -> &std::sync::Arc<FileLockTable> {
+        &self.lock_table
+    }
+
+    // query verified ntfs file identity for open descriptor
+    pub fn file_identity_for_fd(&self, fd: i32) -> Result<NtfsFileIdentity, i32> {
+        let handle = resolve_raw_handle(fd)?;
+        query_ntfs_file_identity(handle)
+    }
+
+    // execute coordinated truncate on open descriptor through per file exclusive lock
+    pub fn truncate_synchronized(&self, fd: i32) -> Result<(), i32> {
+        let handle = resolve_raw_handle(fd)?;
+        let file_id = query_ntfs_file_identity(handle)?;
+        self.lock_table
+            .with_exclusive_lock(file_id, || truncate_verified_handle_to_zero(handle))
+    }
+
+    // execute coordinated write on open descriptor through per file exclusive lock
+    // preserve descriptor file pointer without implicit offset relocation
+    pub fn write_synchronized(&self, fd: i32, data: &[u8]) -> Result<usize, i32> {
+        let handle = resolve_raw_handle(fd)?;
+        let file_id = query_ntfs_file_identity(handle)?;
+        self.lock_table.with_exclusive_lock(file_id, || {
+            let mut total_written: usize = 0;
+            while total_written < data.len() {
+                let remaining = &data[total_written..];
+                let chunk_len = remaining.len().min(u32::MAX as usize) as u32;
+                let mut written: u32 = 0;
+                let ok = unsafe {
+                    WriteFile(
+                        handle,
+                        remaining.as_ptr() as *const std::ffi::c_void,
+                        chunk_len,
+                        &mut written,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 {
+                    return Err(WASI_EIO);
+                }
+                if written == 0 {
+                    break;
+                }
+                total_written += written as usize;
+            }
+            Ok(total_written)
+        })
     }
 
     #[cfg(test)]
@@ -577,6 +754,7 @@ impl WindowsContainmentEngine {
         F: Fn(*mut std::ffi::c_void) -> Result<(), i32> + Send + Sync + 'static,
     {
         Self {
+            lock_table: std::sync::Arc::new(FileLockTable::new()),
             case_query_override: Some(std::sync::Arc::new(hook)),
         }
     }
@@ -711,18 +889,15 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
             }
         }
 
-        // deterministic truncate execution on verified handle
-        // move file pointer to offset 0 before setting end of file
+        // coordinated truncate execution on verified handle under per file exclusive lock
         if flags.truncate && !flags.directory {
-            let move_res = unsafe { SetFilePointer(leaf_handle, 0, std::ptr::null_mut(), 0) };
-            if move_res == 0xFFFFFFFF {
+            let file_id = NtfsFileIdentity::from_info(&info);
+            if let Err(e) = self
+                .lock_table
+                .with_exclusive_lock(file_id, || truncate_verified_handle_to_zero(leaf_handle))
+            {
                 unsafe { NtClose(leaf_handle) };
-                return Err(WASI_EIO);
-            }
-            let ok = unsafe { SetEndOfFile(leaf_handle) };
-            if ok == 0 {
-                unsafe { NtClose(leaf_handle) };
-                return Err(WASI_EIO);
+                return Err(e);
             }
         }
 
@@ -1589,5 +1764,270 @@ mod tests {
         // ancestor casing divergence reject under exact ordinal policy
         assert!(!verify_canonical_containment(Path::new(r"C:\Sandbox\data"), Path::new(r"C:\sandbox\data\file.txt")));
         assert!(!verify_canonical_containment(root, Path::new(r"C:\sandbox\DATA\file.txt")));
+    }
+
+    #[test]
+    fn test_windows_file_lock_table_identity_and_lifecycle() {
+        // verify two handle to same ntfs file share identity and lock instance
+        let temp_dir = std::env::temp_dir().join(format!("plug_win_lock_id_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+
+        let root_file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x02000000)
+            .open(&temp_dir)
+            .unwrap();
+        let root_handle = root_file.as_raw_handle() as isize;
+        let root_fd = unsafe { _open_osfhandle(root_handle, 0x8000) };
+        assert!(root_fd >= 0);
+
+        let engine = WindowsContainmentEngine::new();
+        let create_flags = OpenFlags {
+            read: true,
+            write: true,
+            create: true,
+            truncate: false,
+            directory: false,
+            follow_symlinks: false,
+        };
+
+        let fd1 = engine.open_beneath(root_fd, "same_file.bin", create_flags).unwrap();
+        let fd2 = engine.open_beneath(root_fd, "same_file.bin", create_flags).unwrap();
+        let fd_other = engine.open_beneath(root_fd, "other_file.bin", create_flags).unwrap();
+
+        let id1 = engine.file_identity_for_fd(fd1).unwrap();
+        let id2 = engine.file_identity_for_fd(fd2).unwrap();
+        let id_other = engine.file_identity_for_fd(fd_other).unwrap();
+
+        assert_eq!(id1, id2);
+        assert_ne!(id1, id_other);
+
+        let table = engine.lock_table();
+        assert_eq!(table.active_entry_count(), 0);
+
+        // acquire two handle for same file identity and verify single shared arc
+        let lock_a = table.acquire_lock_handle(id1);
+        let lock_b = table.acquire_lock_handle(id2);
+        assert!(std::sync::Arc::ptr_eq(&lock_a, &lock_b));
+        assert_eq!(table.active_entry_count(), 1);
+
+        // release first handle while second handle remain active
+        table.release_lock_handle(id1, lock_a);
+        assert_eq!(table.active_entry_count(), 1);
+
+        // third contender must receive exact same active lock instance
+        let lock_c = table.acquire_lock_handle(id1);
+        assert!(std::sync::Arc::ptr_eq(&lock_b, &lock_c));
+
+        // release remaining handle and verify table prune entry
+        table.release_lock_handle(id2, lock_b);
+        assert_eq!(table.active_entry_count(), 1);
+        table.release_lock_handle(id1, lock_c);
+        assert_eq!(table.active_entry_count(), 0);
+
+        // verify error return and panic unwind release lock and prune entry cleanly
+        let err_res: Result<(), i32> = table.with_exclusive_lock(id1, || Err(WASI_EIO));
+        assert_eq!(err_res, Err(WASI_EIO));
+        assert_eq!(table.active_entry_count(), 0);
+
+        let unwind_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            table.with_exclusive_lock(id1, || {
+                panic!("simulated panic inside exclusive lock");
+            });
+        }));
+        assert!(unwind_res.is_err());
+        assert_eq!(table.active_entry_count(), 0);
+
+        let post_panic_res: Result<u32, i32> = table.with_exclusive_lock(id1, || Ok(42));
+        assert_eq!(post_panic_res, Ok(42));
+        assert_eq!(table.active_entry_count(), 0);
+
+        // stress concurrent acquire and release to verify zero split lock under contention
+        let active_writers = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let mut threads = Vec::new();
+
+        for _ in 0..4 {
+            let eng = engine.clone();
+            let aw = std::sync::Arc::clone(&active_writers);
+            let bar = std::sync::Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                bar.wait();
+                for _ in 0..200 {
+                    eng.lock_table().with_exclusive_lock(id1, || {
+                        let prev = aw.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        assert_eq!(prev, 0, "split lock detected for active file identity");
+                        std::thread::yield_now();
+                        aw.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    });
+                }
+            }));
+        }
+
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(table.active_entry_count(), 0);
+
+        unsafe {
+            libc::close(fd1);
+            libc::close(fd2);
+            libc::close(fd_other);
+        }
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_windows_truncate_write_concurrency_two_handles() {
+        // verify coordinated truncate and write across two independent handle on ntfs
+        let temp_dir = std::env::temp_dir().join(format!("plug_win_tw_conc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let target_path = temp_dir.join("shared_conc.bin");
+
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+
+        let root_file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x02000000)
+            .open(&temp_dir)
+            .unwrap();
+        let root_handle = root_file.as_raw_handle() as isize;
+        let root_fd = unsafe { _open_osfhandle(root_handle, 0x8000) };
+        assert!(root_fd >= 0);
+
+        let engine = WindowsContainmentEngine::new();
+        let rw_flags = OpenFlags {
+            read: true,
+            write: true,
+            create: true,
+            truncate: false,
+            directory: false,
+            follow_symlinks: false,
+        };
+        let trunc_open_flags = OpenFlags {
+            read: true,
+            write: true,
+            create: false,
+            truncate: true,
+            directory: false,
+            follow_symlinks: false,
+        };
+
+        let fd_writer = engine.open_beneath(root_fd, "shared_conc.bin", rw_flags).unwrap();
+        let fd_trunc = engine.open_beneath(root_fd, "shared_conc.bin", rw_flags).unwrap();
+        assert_eq!(
+            engine.file_identity_for_fd(fd_writer).unwrap(),
+            engine.file_identity_for_fd(fd_trunc).unwrap()
+        );
+
+        // order check 1 write followed by truncate produce zero byte file
+        let written = engine.write_synchronized(fd_writer, &[0x41u8; 256]).unwrap();
+        assert_eq!(written, 256);
+        assert_eq!(std::fs::metadata(&target_path).unwrap().len(), 256);
+
+        engine.truncate_synchronized(fd_trunc).unwrap();
+        assert_eq!(std::fs::metadata(&target_path).unwrap().len(), 0);
+
+        // order check 2 write on first handle after truncate on second handle preserve descriptor offset
+        // descriptor offset remain at 256 so write of 64 byte extend file to 320 byte
+        let written_after = engine.write_synchronized(fd_writer, &[0x5Au8; 64]).unwrap();
+        assert_eq!(written_after, 64);
+        let after_bytes = std::fs::read(&target_path).unwrap();
+        assert_eq!(after_bytes.len(), 256 + 64);
+        assert!(after_bytes[..256].iter().all(|&b| b == 0));
+        assert!(after_bytes[256..].iter().all(|&b| b == 0x5A));
+
+        // order check 3 open with truncate flag reset file to zero and write from initial offset zero
+        let transient_trunc_fd = engine
+            .open_beneath(root_fd, "shared_conc.bin", trunc_open_flags)
+            .unwrap();
+        assert_eq!(std::fs::metadata(&target_path).unwrap().len(), 0);
+        engine.write_synchronized(transient_trunc_fd, &[0x33u8; 128]).unwrap();
+        unsafe { libc::close(transient_trunc_fd) };
+        let fresh_bytes = std::fs::read(&target_path).unwrap();
+        assert_eq!(fresh_bytes.len(), 128);
+        assert!(fresh_bytes.iter().all(|&b| b == 0x33));
+
+        unsafe { libc::close(fd_writer) };
+
+        // concurrent stress rounds with deterministic barrier synchronization
+        let fd_writer_stress = engine.open_beneath(root_fd, "shared_conc.bin", trunc_open_flags).unwrap();
+        let rounds = 40usize;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let eng_writer = engine.clone();
+        let bar_writer = std::sync::Arc::clone(&barrier);
+        let writer_thread = std::thread::spawn(move || {
+            for r in 0..rounds {
+                bar_writer.wait();
+                let tag = ((r % 200) as u8).saturating_add(1);
+                let frame = [tag; 256];
+                for _ in 0..4 {
+                    eng_writer.write_synchronized(fd_writer_stress, &frame).unwrap();
+                }
+                bar_writer.wait();
+            }
+        });
+
+        let eng_trunc = engine.clone();
+        let bar_trunc = std::sync::Arc::clone(&barrier);
+        let trunc_thread = std::thread::spawn(move || {
+            for r in 0..rounds {
+                bar_trunc.wait();
+                if r % 2 == 0 {
+                    eng_trunc.truncate_synchronized(fd_trunc).unwrap();
+                } else {
+                    let tfd = eng_trunc
+                        .open_beneath(root_fd, "shared_conc.bin", trunc_open_flags)
+                        .unwrap();
+                    unsafe { libc::close(tfd) };
+                }
+                bar_trunc.wait();
+
+                // validate file state after each round match valid sequential execution
+                let data = std::fs::read(&target_path).unwrap();
+                let expected_tag = ((r % 200) as u8).saturating_add(1);
+                assert_eq!(data.len() % 256, 0, "torn frame size detected");
+                if !data.is_empty() {
+                    assert_eq!(
+                        data.len(),
+                        (r + 1) * 1024,
+                        "unexpected file length for sequential write offset"
+                    );
+                    let mut seen_written_frame = false;
+                    for chunk in data.chunks_exact(256) {
+                        let first = chunk[0];
+                        assert!(
+                            chunk.iter().all(|&b| b == first),
+                            "interleaved write or partial frame corruption detected"
+                        );
+                        if first != 0 {
+                            seen_written_frame = true;
+                            assert_eq!(first, expected_tag, "unexpected frame tag after truncate");
+                        } else if seen_written_frame {
+                            panic!("zero hole detected after post-truncate write frame");
+                        }
+                    }
+                    assert!(seen_written_frame, "non-empty file after write must contain final frame");
+                }
+            }
+        });
+
+        writer_thread.join().unwrap();
+        trunc_thread.join().unwrap();
+        assert_eq!(engine.lock_table().active_entry_count(), 0);
+
+        unsafe {
+            libc::close(fd_writer_stress);
+            libc::close(fd_trunc);
+        }
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

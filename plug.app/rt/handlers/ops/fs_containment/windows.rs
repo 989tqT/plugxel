@@ -212,6 +212,21 @@ impl FileLockTable {
         f()
     }
 
+    // execute closure under shared per file lock with unwind safe entry release
+    pub fn with_shared_lock<F, R>(&self, id: NtfsFileIdentity, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let entry_guard = LockEntryReleaseGuard {
+            table: self,
+            id,
+            handle: Some(self.acquire_lock_handle(id)),
+        };
+        let lock_ref = entry_guard.handle.as_ref().unwrap();
+        let _read_guard = lock_ref.read().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
+
     // return count of active file identity entry in table
     pub fn active_entry_count(&self) -> usize {
         let map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
@@ -275,6 +290,7 @@ extern "system" {
         dw_flags: u32,
     ) -> u32;
 
+    #[cfg(test)]
     fn WriteFile(
         h_file: *mut std::ffi::c_void,
         lp_buffer: *const std::ffi::c_void,
@@ -283,9 +299,11 @@ extern "system" {
         lp_overlapped: *mut std::ffi::c_void,
     ) -> i32;
 
+    #[cfg(test)]
     fn CloseHandle(h_object: *mut std::ffi::c_void) -> i32;
 }
 
+#[cfg(test)]
 extern "C" {
     fn _open_osfhandle(osfhandle: isize, flags: i32) -> i32;
     fn _get_osfhandle(fd: i32) -> isize;
@@ -308,7 +326,8 @@ pub fn map_ntstatus_to_wasi(status: i32) -> i32 {
     }
 }
 
-// resolve raw handle from root descriptor
+// resolve raw handle from crt descriptor in test harness
+#[cfg(test)]
 fn resolve_raw_handle(root_fd: i32) -> Result<*mut std::ffi::c_void, i32> {
     if root_fd < 0 {
         return Err(WASI_EBADF);
@@ -665,9 +684,10 @@ fn query_ntfs_file_identity(handle: *mut std::ffi::c_void) -> Result<NtfsFileIde
     Ok(NtfsFileIdentity::from_info(&info))
 }
 
-// truncate verified handle to zero via fileendoffileinfo class under exclusive lock
-fn truncate_verified_handle_to_zero(handle: *mut std::ffi::c_void) -> Result<(), i32> {
-    let mut eof_info = FileEndOfFileInfo { end_of_file: 0 };
+// set verified handle end of file via fileendoffileinfo class under exclusive lock
+fn set_verified_handle_end_of_file(handle: *mut std::ffi::c_void, size: u64) -> Result<(), WasiErrno> {
+    let eof = i64::try_from(size).map_err(|_| WASI_EINVAL)?;
+    let mut eof_info = FileEndOfFileInfo { end_of_file: eof };
     let ok = unsafe {
         SetFileInformationByHandle(
             handle,
@@ -682,6 +702,54 @@ fn truncate_verified_handle_to_zero(handle: *mut std::ffi::c_void) -> Result<(),
     Ok(())
 }
 
+// truncate verified handle to zero via fileendoffileinfo class under exclusive lock
+fn truncate_verified_handle_to_zero(handle: *mut std::ffi::c_void) -> Result<(), WasiErrno> {
+    set_verified_handle_end_of_file(handle, 0)
+}
+
+// open host directory handle for containment root without follow reparse point
+pub fn open_directory_for_containment(path: &Path) -> Result<std::fs::File, WasiErrno> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    // 0x02000000 backup semantic flag and 0x00200000 open reparse point flag
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0x02000000 | 0x00200000)
+        .open(path)
+        .map_err(|_| WASI_ENOENT)?;
+
+    let raw_handle = file.as_raw_handle() as *mut std::ffi::c_void;
+
+    let mut info = std::mem::MaybeUninit::<ByHandleFileInformation>::uninit();
+    let ok = unsafe { GetFileInformationByHandle(raw_handle, info.as_mut_ptr()) };
+    if ok == 0 {
+        return Err(WASI_EIO);
+    }
+    let info = unsafe { info.assume_init() };
+
+    if info.dw_file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return Err(WASI_ENOTDIR);
+    }
+    if info.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(WASI_ENOTCAPABLE);
+    }
+
+    check_parent_case_sensitivity(raw_handle)?;
+
+    Ok(file)
+}
+
+// query verified ntfs file identity for owned runtime file handle
+pub fn query_file_identity(file: &std::fs::File) -> Result<NtfsFileIdentity, WasiErrno> {
+    use std::os::windows::io::AsRawHandle;
+    let handle = file.as_raw_handle() as *mut std::ffi::c_void;
+    if handle.is_null() || handle as isize == -1 {
+        return Err(WASI_EBADF);
+    }
+    query_ntfs_file_identity(handle)
+}
+
 #[derive(Clone)]
 pub struct WindowsContainmentEngine {
     lock_table: std::sync::Arc<FileLockTable>,
@@ -691,8 +759,13 @@ pub struct WindowsContainmentEngine {
 
 impl WindowsContainmentEngine {
     pub fn new() -> Self {
+        Self::with_lock_table(std::sync::Arc::new(FileLockTable::new()))
+    }
+
+    // construct engine bound to shared runtime file lock table
+    pub fn with_lock_table(lock_table: std::sync::Arc<FileLockTable>) -> Self {
         Self {
-            lock_table: std::sync::Arc::new(FileLockTable::new()),
+            lock_table,
             #[cfg(test)]
             case_query_override: None,
         }
@@ -702,13 +775,32 @@ impl WindowsContainmentEngine {
         &self.lock_table
     }
 
-    // query verified ntfs file identity for open descriptor
+    // query verified ntfs file identity for owned runtime file handle
+    pub fn file_identity_for_file(&self, file: &std::fs::File) -> Result<NtfsFileIdentity, WasiErrno> {
+        query_file_identity(file)
+    }
+
+    // execute coordinated size update on owned runtime file handle through per file exclusive lock
+    pub fn set_file_size_for_file(&self, file: &std::fs::File, size: u64) -> Result<(), WasiErrno> {
+        use std::os::windows::io::AsRawHandle;
+        let handle = file.as_raw_handle() as *mut std::ffi::c_void;
+        if handle.is_null() || handle as isize == -1 {
+            return Err(WASI_EBADF);
+        }
+        let file_id = query_ntfs_file_identity(handle)?;
+        self.lock_table
+            .with_exclusive_lock(file_id, || set_verified_handle_end_of_file(handle, size))
+    }
+
+    // query verified ntfs file identity for open descriptor in spike test
+    #[cfg(test)]
     pub fn file_identity_for_fd(&self, fd: i32) -> Result<NtfsFileIdentity, i32> {
         let handle = resolve_raw_handle(fd)?;
         query_ntfs_file_identity(handle)
     }
 
-    // execute coordinated truncate on open descriptor through per file exclusive lock
+    // execute coordinated truncate on open descriptor through per file exclusive lock in spike test
+    #[cfg(test)]
     pub fn truncate_synchronized(&self, fd: i32) -> Result<(), i32> {
         let handle = resolve_raw_handle(fd)?;
         let file_id = query_ntfs_file_identity(handle)?;
@@ -716,8 +808,9 @@ impl WindowsContainmentEngine {
             .with_exclusive_lock(file_id, || truncate_verified_handle_to_zero(handle))
     }
 
-    // execute coordinated write on open descriptor through per file exclusive lock
+    // execute coordinated write on open descriptor through per file exclusive lock in spike test
     // preserve descriptor file pointer without implicit offset relocation
+    #[cfg(test)]
     pub fn write_synchronized(&self, fd: i32, data: &[u8]) -> Result<usize, i32> {
         let handle = resolve_raw_handle(fd)?;
         let file_id = query_ntfs_file_identity(handle)?;
@@ -766,11 +859,18 @@ impl WindowsContainmentEngine {
         }
         check_parent_case_sensitivity(handle)
     }
-}
 
-impl AtomicContainmentEngine for WindowsContainmentEngine {
-    fn open_beneath(&self, root_fd: i32, rel_path: &str, flags: OpenFlags) -> Result<i32, i32> {
-        let root_handle = resolve_raw_handle(root_fd)?;
+    fn open_owned_handle_beneath(
+        &self,
+        root_handle: *mut std::ffi::c_void,
+        rel_path: &str,
+        flags: OpenFlags,
+    ) -> Result<std::os::windows::io::OwnedHandle, WasiErrno> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
+        if root_handle.is_null() || root_handle as isize == -1 {
+            return Err(WASI_EBADF);
+        }
         let components = parse_relative_components(rel_path)?;
 
         let mut root_info = std::mem::MaybeUninit::<ByHandleFileInformation>::uninit();
@@ -847,32 +947,31 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
             unsafe { NtClose(parent_handle) };
         }
 
-        let leaf_handle = leaf_res?;
+        // transfer raw handle ownership to ownedhandle immediately before fallible check
+        let raw_leaf = leaf_res?;
+        let owned_leaf = unsafe { OwnedHandle::from_raw_handle(raw_leaf as _) };
+        let leaf_handle = owned_leaf.as_raw_handle() as *mut std::ffi::c_void;
 
         let mut info = std::mem::MaybeUninit::<ByHandleFileInformation>::uninit();
         let ok = unsafe { GetFileInformationByHandle(leaf_handle, info.as_mut_ptr()) };
         if ok == 0 {
-            unsafe { NtClose(leaf_handle) };
             return Err(WASI_EIO);
         }
         let info = unsafe { info.assume_init() };
 
         // reject reparse point
         if info.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            unsafe { NtClose(leaf_handle) };
             return Err(WASI_ENOTCAPABLE);
         }
 
         // hard link containment policy check
         // reject file with multiple hard link to prevent external alias write
         if !flags.directory && info.n_number_of_links > 1 {
-            unsafe { NtClose(leaf_handle) };
             return Err(WASI_ENOTCAPABLE);
         }
 
         // volume cross device check
         if info.dw_volume_serial_number != root_info.dw_volume_serial_number {
-            unsafe { NtClose(leaf_handle) };
             return Err(WASI_ENOTCAPABLE);
         }
 
@@ -880,11 +979,9 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
         if let Some(root_path) = get_canonical_handle_path(root_handle) {
             if let Some(leaf_path) = get_canonical_handle_path(leaf_handle) {
                 if !verify_canonical_containment(&root_path, &leaf_path) {
-                    unsafe { NtClose(leaf_handle) };
                     return Err(WASI_ENOTCAPABLE);
                 }
             } else {
-                unsafe { NtClose(leaf_handle) };
                 return Err(WASI_ENOTCAPABLE);
             }
         }
@@ -892,27 +989,19 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
         // coordinated truncate execution on verified handle under per file exclusive lock
         if flags.truncate && !flags.directory {
             let file_id = NtfsFileIdentity::from_info(&info);
-            if let Err(e) = self
-                .lock_table
-                .with_exclusive_lock(file_id, || truncate_verified_handle_to_zero(leaf_handle))
-            {
-                unsafe { NtClose(leaf_handle) };
-                return Err(e);
-            }
+            self.lock_table
+                .with_exclusive_lock(file_id, || truncate_verified_handle_to_zero(leaf_handle))?;
         }
 
-        let crt_flags = if flags.write || flags.create || flags.truncate { 0x0002 | 0x8000 } else { 0x0000 | 0x8000 };
-        let fd = unsafe { _open_osfhandle(leaf_handle as isize, crt_flags) };
-        if fd < 0 {
-            unsafe { NtClose(leaf_handle) };
-            return Err(WASI_EIO);
-        }
-
-        Ok(fd)
+        Ok(owned_leaf)
     }
 
-    fn mkdir_beneath(&self, root_fd: i32, rel_path: &str) -> Result<(), i32> {
-        let root_handle = resolve_raw_handle(root_fd)?;
+    fn mkdir_raw_handle_beneath(&self, root_handle: *mut std::ffi::c_void, rel_path: &str) -> Result<(), WasiErrno> {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+
+        if root_handle.is_null() || root_handle as isize == -1 {
+            return Err(WASI_EBADF);
+        }
         let components = parse_relative_components(rel_path)?;
 
         // pre-open inspection verify root directory case sensitivity before resolve any child
@@ -948,17 +1037,17 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
             unsafe { NtClose(parent_handle) };
         }
 
-        match res {
-            Ok(h) => {
-                unsafe { NtClose(h) };
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        let raw_dir = res?;
+        let _owned_dir = unsafe { OwnedHandle::from_raw_handle(raw_dir as _) };
+        Ok(())
     }
 
-    fn unlink_file_beneath(&self, root_fd: i32, rel_path: &str) -> Result<(), i32> {
-        let root_handle = resolve_raw_handle(root_fd)?;
+    fn unlink_raw_handle_beneath(&self, root_handle: *mut std::ffi::c_void, rel_path: &str) -> Result<(), WasiErrno> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
+        if root_handle.is_null() || root_handle as isize == -1 {
+            return Err(WASI_EBADF);
+        }
         let components = parse_relative_components(rel_path)?;
 
         // pre-open inspection verify root directory case sensitivity before resolve any child
@@ -994,23 +1083,23 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
             unsafe { NtClose(parent_handle) };
         }
 
-        let leaf_handle = res?;
+        // transfer raw handle ownership to ownedhandle immediately before fallible check
+        let raw_leaf = res?;
+        let owned_leaf = unsafe { OwnedHandle::from_raw_handle(raw_leaf as _) };
+        let leaf_handle = owned_leaf.as_raw_handle() as *mut std::ffi::c_void;
 
         let mut info = std::mem::MaybeUninit::<ByHandleFileInformation>::uninit();
         let ok = unsafe { GetFileInformationByHandle(leaf_handle, info.as_mut_ptr()) };
         if ok == 0 {
-            unsafe { NtClose(leaf_handle) };
             return Err(WASI_EIO);
         }
         let info = unsafe { info.assume_init() };
 
         if info.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            unsafe { NtClose(leaf_handle) };
             return Err(WASI_ENOTCAPABLE);
         }
 
         if info.n_number_of_links > 1 {
-            unsafe { NtClose(leaf_handle) };
             return Err(WASI_ENOTCAPABLE);
         }
 
@@ -1024,8 +1113,6 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
             )
         };
 
-        unsafe { NtClose(leaf_handle) };
-
         if ok == 0 {
             Err(WASI_EIO)
         } else {
@@ -1033,8 +1120,12 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
         }
     }
 
-    fn rmdir_beneath(&self, root_fd: i32, rel_path: &str) -> Result<(), i32> {
-        let root_handle = resolve_raw_handle(root_fd)?;
+    fn rmdir_raw_handle_beneath(&self, root_handle: *mut std::ffi::c_void, rel_path: &str) -> Result<(), WasiErrno> {
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
+        if root_handle.is_null() || root_handle as isize == -1 {
+            return Err(WASI_EBADF);
+        }
         let components = parse_relative_components(rel_path)?;
 
         // pre-open inspection verify root directory case sensitivity before resolve any child
@@ -1070,18 +1161,19 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
             unsafe { NtClose(parent_handle) };
         }
 
-        let leaf_handle = res?;
+        // transfer raw handle ownership to ownedhandle immediately before fallible check
+        let raw_leaf = res?;
+        let owned_leaf = unsafe { OwnedHandle::from_raw_handle(raw_leaf as _) };
+        let leaf_handle = owned_leaf.as_raw_handle() as *mut std::ffi::c_void;
 
         let mut info = std::mem::MaybeUninit::<ByHandleFileInformation>::uninit();
         let ok = unsafe { GetFileInformationByHandle(leaf_handle, info.as_mut_ptr()) };
         if ok == 0 {
-            unsafe { NtClose(leaf_handle) };
             return Err(WASI_EIO);
         }
         let info = unsafe { info.assume_init() };
 
         if info.dw_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            unsafe { NtClose(leaf_handle) };
             return Err(WASI_ENOTCAPABLE);
         }
 
@@ -1095,13 +1187,75 @@ impl AtomicContainmentEngine for WindowsContainmentEngine {
             )
         };
 
-        unsafe { NtClose(leaf_handle) };
-
         if ok == 0 {
             Err(WASI_ENOTEMPTY)
         } else {
             Ok(())
         }
+    }
+}
+
+impl RuntimeContainmentEngine for WindowsContainmentEngine {
+    fn open_file_beneath(
+        &self,
+        root_dir: &std::fs::File,
+        rel_path: &str,
+        flags: OpenFlags,
+    ) -> Result<std::fs::File, WasiErrno> {
+        use std::os::windows::io::AsRawHandle;
+        let root_handle = root_dir.as_raw_handle() as *mut std::ffi::c_void;
+        let owned = self.open_owned_handle_beneath(root_handle, rel_path, flags)?;
+        Ok(std::fs::File::from(owned))
+    }
+
+    fn mkdir_file_beneath(&self, root_dir: &std::fs::File, rel_path: &str) -> Result<(), WasiErrno> {
+        use std::os::windows::io::AsRawHandle;
+        let root_handle = root_dir.as_raw_handle() as *mut std::ffi::c_void;
+        self.mkdir_raw_handle_beneath(root_handle, rel_path)
+    }
+
+    fn unlink_file_beneath_handle(&self, root_dir: &std::fs::File, rel_path: &str) -> Result<(), WasiErrno> {
+        use std::os::windows::io::AsRawHandle;
+        let root_handle = root_dir.as_raw_handle() as *mut std::ffi::c_void;
+        self.unlink_raw_handle_beneath(root_handle, rel_path)
+    }
+
+    fn rmdir_beneath_handle(&self, root_dir: &std::fs::File, rel_path: &str) -> Result<(), WasiErrno> {
+        use std::os::windows::io::AsRawHandle;
+        let root_handle = root_dir.as_raw_handle() as *mut std::ffi::c_void;
+        self.rmdir_raw_handle_beneath(root_handle, rel_path)
+    }
+}
+
+#[cfg(test)]
+impl AtomicContainmentEngine for WindowsContainmentEngine {
+    fn open_beneath(&self, root_fd: i32, rel_path: &str, flags: OpenFlags) -> Result<i32, i32> {
+        use std::os::windows::io::IntoRawHandle;
+        let root_handle = resolve_raw_handle(root_fd)?;
+        let owned_leaf = self.open_owned_handle_beneath(root_handle, rel_path, flags)?;
+        let leaf_handle = owned_leaf.into_raw_handle() as *mut std::ffi::c_void;
+        let crt_flags = if flags.write || flags.create || flags.truncate { 0x0002 | 0x8000 } else { 0x0000 | 0x8000 };
+        let fd = unsafe { _open_osfhandle(leaf_handle as isize, crt_flags) };
+        if fd < 0 {
+            unsafe { NtClose(leaf_handle) };
+            return Err(WASI_EIO);
+        }
+        Ok(fd)
+    }
+
+    fn mkdir_beneath(&self, root_fd: i32, rel_path: &str) -> Result<(), i32> {
+        let root_handle = resolve_raw_handle(root_fd)?;
+        self.mkdir_raw_handle_beneath(root_handle, rel_path)
+    }
+
+    fn unlink_file_beneath(&self, root_fd: i32, rel_path: &str) -> Result<(), i32> {
+        let root_handle = resolve_raw_handle(root_fd)?;
+        self.unlink_raw_handle_beneath(root_handle, rel_path)
+    }
+
+    fn rmdir_beneath(&self, root_fd: i32, rel_path: &str) -> Result<(), i32> {
+        let root_handle = resolve_raw_handle(root_fd)?;
+        self.rmdir_raw_handle_beneath(root_handle, rel_path)
     }
 }
 
@@ -2028,6 +2182,92 @@ mod tests {
             libc::close(fd_writer_stress);
             libc::close(fd_trunc);
         }
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_windows_runtime_owned_handle_and_shared_lock_contract() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let temp_dir = std::env::temp_dir().join(format!("plug_win_rt_owned_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        // open root directory via production owned handle helper
+        let root_dir = open_directory_for_containment(&temp_dir).unwrap();
+        let engine = WindowsContainmentEngine::new();
+
+        // verify runtime directory creation and file creation without crt fd wrapper
+        engine.mkdir_file_beneath(&root_dir, "sub").unwrap();
+        let mut f1 = engine
+            .open_file_beneath(
+                &root_dir,
+                "sub/data.bin",
+                OpenFlags {
+                    read: true,
+                    write: true,
+                    create: true,
+                    truncate: true,
+                    directory: false,
+                    follow_symlinks: false,
+                },
+            )
+            .unwrap();
+
+        let mut f2 = engine
+            .open_file_beneath(
+                &root_dir,
+                "sub/data.bin",
+                OpenFlags {
+                    read: true,
+                    write: false,
+                    create: false,
+                    truncate: false,
+                    directory: false,
+                    follow_symlinks: false,
+                },
+            )
+            .unwrap();
+
+        let id1 = engine.file_identity_for_file(&f1).unwrap();
+        let id2 = engine.file_identity_for_file(&f2).unwrap();
+        assert_eq!(id1, id2);
+
+        // write payload under exclusive lock and resize via runtime file helper
+        engine.lock_table().with_exclusive_lock(id1, || {
+            f1.write_all(&[0x5Au8; 64]).unwrap();
+        });
+        assert_eq!(engine.lock_table().active_entry_count(), 0);
+
+        engine.set_file_size_for_file(&f1, 32).unwrap();
+        assert_eq!(engine.lock_table().active_entry_count(), 0);
+
+        // read payload under shared lock and verify panic unwind release
+        let read_bytes = engine.lock_table().with_shared_lock(id2, || {
+            f2.seek(SeekFrom::Start(0)).unwrap();
+            let mut buf = Vec::new();
+            f2.read_to_end(&mut buf).unwrap();
+            buf
+        });
+        assert_eq!(read_bytes, vec![0x5Au8; 32]);
+        assert_eq!(engine.lock_table().active_entry_count(), 0);
+
+        let unwind_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.lock_table().with_shared_lock(id2, || -> Result<(), i32> {
+                panic!("simulated panic inside shared lock closure");
+            })
+        }));
+        assert!(unwind_res.is_err());
+        assert_eq!(engine.lock_table().active_entry_count(), 0);
+
+        drop(f1);
+        drop(f2);
+
+        // verify runtime unlink and rmdir via owned directory handle
+        engine.unlink_file_beneath_handle(&root_dir, "sub/data.bin").unwrap();
+        engine.rmdir_beneath_handle(&root_dir, "sub").unwrap();
+        drop(root_dir);
+
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

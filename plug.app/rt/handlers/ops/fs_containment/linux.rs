@@ -162,19 +162,21 @@ impl AtomicContainmentEngine for LinuxContainmentEngine {
                 resolve,
             };
 
-            let fd = Self::openat2_syscall(root_fd, &c_path, &how)?;
+            use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+            let raw_fd = Self::openat2_syscall(root_fd, &c_path, &how)?;
+            // transfer descriptor ownership to ownedfd immediately before fallible check
+            let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
             // deferred truncate on verified descriptor
             if flags.truncate && flags.write {
                 unsafe {
-                    if libc::ftruncate(fd, 0) != 0 {
-                        libc::close(fd);
+                    if libc::ftruncate(owned_fd.as_raw_fd(), 0) != 0 {
                         return Err(WASI_EIO);
                     }
                 }
             }
 
-            Ok(fd)
+            Ok(owned_fd.into_raw_fd())
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -190,18 +192,17 @@ impl AtomicContainmentEngine for LinuxContainmentEngine {
 
         #[cfg(target_os = "linux")]
         {
-            let parent_dfd = if let Some(parent) = parent_opt {
-                self.open_parent_pinned(root_fd, &parent)?
+            use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+            let owned_parent = if let Some(parent) = parent_opt {
+                let raw_parent = self.open_parent_pinned(root_fd, &parent)?;
+                Some(unsafe { OwnedFd::from_raw_fd(raw_parent) })
             } else {
-                root_fd
+                None
             };
+            let parent_dfd = owned_parent.as_ref().map(|fd| fd.as_raw_fd()).unwrap_or(root_fd);
 
             let c_leaf = CString::new(leaf).map_err(|_| WASI_EINVAL)?;
             let res = unsafe { libc::mkdirat(parent_dfd, c_leaf.as_ptr(), 0o755) };
-
-            if parent_dfd != root_fd {
-                unsafe { libc::close(parent_dfd); }
-            }
 
             if res == 0 {
                 Ok(())
@@ -223,18 +224,17 @@ impl AtomicContainmentEngine for LinuxContainmentEngine {
 
         #[cfg(target_os = "linux")]
         {
-            let parent_dfd = if let Some(parent) = parent_opt {
-                self.open_parent_pinned(root_fd, &parent)?
+            use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+            let owned_parent = if let Some(parent) = parent_opt {
+                let raw_parent = self.open_parent_pinned(root_fd, &parent)?;
+                Some(unsafe { OwnedFd::from_raw_fd(raw_parent) })
             } else {
-                root_fd
+                None
             };
+            let parent_dfd = owned_parent.as_ref().map(|fd| fd.as_raw_fd()).unwrap_or(root_fd);
 
             let c_leaf = CString::new(leaf).map_err(|_| WASI_EINVAL)?;
             let res = unsafe { libc::unlinkat(parent_dfd, c_leaf.as_ptr(), 0) };
-
-            if parent_dfd != root_fd {
-                unsafe { libc::close(parent_dfd); }
-            }
 
             if res == 0 {
                 Ok(())
@@ -256,18 +256,17 @@ impl AtomicContainmentEngine for LinuxContainmentEngine {
 
         #[cfg(target_os = "linux")]
         {
-            let parent_dfd = if let Some(parent) = parent_opt {
-                self.open_parent_pinned(root_fd, &parent)?
+            use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+            let owned_parent = if let Some(parent) = parent_opt {
+                let raw_parent = self.open_parent_pinned(root_fd, &parent)?;
+                Some(unsafe { OwnedFd::from_raw_fd(raw_parent) })
             } else {
-                root_fd
+                None
             };
+            let parent_dfd = owned_parent.as_ref().map(|fd| fd.as_raw_fd()).unwrap_or(root_fd);
 
             let c_leaf = CString::new(leaf).map_err(|_| WASI_EINVAL)?;
             let res = unsafe { libc::unlinkat(parent_dfd, c_leaf.as_ptr(), libc::AT_REMOVEDIR) };
-
-            if parent_dfd != root_fd {
-                unsafe { libc::close(parent_dfd); }
-            }
 
             if res == 0 {
                 Ok(())
@@ -280,6 +279,99 @@ impl AtomicContainmentEngine for LinuxContainmentEngine {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (root_fd, parent_opt, leaf);
+            Err(WASI_ENOTCAPABLE)
+        }
+    }
+}
+
+// open directory handle for containment root on linux
+pub fn open_directory_for_containment(path: &std::path::Path) -> Result<std::fs::File, WasiErrno> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::FromRawFd;
+        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| WASI_EINVAL)?;
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            let err = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EINVAL);
+            return Err(map_linux_openat2_err(err));
+        }
+        let owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) };
+        Ok(std::fs::File::from(owned))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Err(WASI_ENOTCAPABLE)
+    }
+}
+
+impl RuntimeContainmentEngine for LinuxContainmentEngine {
+    fn open_file_beneath(
+        &self,
+        root_dir: &std::fs::File,
+        rel_path: &str,
+        flags: OpenFlags,
+    ) -> Result<std::fs::File, WasiErrno> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::{AsRawFd, FromRawFd};
+            let fd = self.open_beneath(root_dir.as_raw_fd(), rel_path, flags)?;
+            let owned = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) };
+            Ok(std::fs::File::from(owned))
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (root_dir, rel_path, flags);
+            Err(WASI_ENOTCAPABLE)
+        }
+    }
+
+    fn mkdir_file_beneath(&self, root_dir: &std::fs::File, rel_path: &str) -> Result<(), WasiErrno> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            self.mkdir_beneath(root_dir.as_raw_fd(), rel_path)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (root_dir, rel_path);
+            Err(WASI_ENOTCAPABLE)
+        }
+    }
+
+    fn unlink_file_beneath_handle(&self, root_dir: &std::fs::File, rel_path: &str) -> Result<(), WasiErrno> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            self.unlink_file_beneath(root_dir.as_raw_fd(), rel_path)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (root_dir, rel_path);
+            Err(WASI_ENOTCAPABLE)
+        }
+    }
+
+    fn rmdir_beneath_handle(&self, root_dir: &std::fs::File, rel_path: &str) -> Result<(), WasiErrno> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            self.rmdir_beneath(root_dir.as_raw_fd(), rel_path)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (root_dir, rel_path);
             Err(WASI_ENOTCAPABLE)
         }
     }

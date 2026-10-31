@@ -22,6 +22,7 @@ pub const WASI_ENOENT: i32 = 44;
 pub const WASI_ENOSYS: i32 = 52;
 pub const WASI_ENOTDIR: i32 = 54;
 pub const WASI_ENOTEMPTY: i32 = 55;
+pub const WASI_ENOTSUP: i32 = 58;
 pub const WASI_EPERM: i32 = 63;
 pub const WASI_EROFS: i32 = 69;
 pub const WASI_EXDEV: i32 = 75;
@@ -154,6 +155,7 @@ impl WasiRights {
     );
 
     // right actually supported by plugxel for regular file descriptor
+    // exclude poll_fd_readwrite because poll_oneoff readiness polling is not implemented
     pub const SUPPORTED_REGULAR_FILE_BASE: Self = Self(
         Self::FD_DATASYNC
             | Self::FD_READ
@@ -166,8 +168,7 @@ impl WasiRights {
             | Self::FD_ALLOCATE
             | Self::FD_FILESTAT_GET
             | Self::FD_FILESTAT_SET_SIZE
-            | Self::FD_FILESTAT_SET_TIMES
-            | Self::POLL_FD_READWRITE,
+            | Self::FD_FILESTAT_SET_TIMES,
     );
 
     // right supported for inheritance from directory descriptor to child descriptor
@@ -295,6 +296,21 @@ impl DescriptorFlags {
             Ok(Self(raw))
         }
     }
+
+    // fdflag actually honored by active runtime io path
+    // empty until b3.2 wire append into fd_write path
+    pub const RUNTIME_SUPPORTED: u16 = 0;
+
+    // validate fdflag at syscall boundary and reject protocol valid but unhonored flag
+    pub const fn from_raw_runtime_supported(raw: u16) -> Result<Self, WasiErrno> {
+        if (raw & !Self::ALL_VALID) != 0 {
+            return Err(WASI_EINVAL);
+        }
+        if (raw & !Self::RUNTIME_SUPPORTED) != 0 {
+            return Err(WASI_ENOTSUP);
+        }
+        Ok(Self(raw))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,6 +321,8 @@ pub struct DescriptorRights {
 
 impl DescriptorRights {
     pub const PACKED_INHERITING_SHIFT: u32 = 29;
+    // bit 0..58 carry base and inheriting while bit 58..64 must stay zero
+    pub const PACKED_VALID_MASK: u64 = (1 << 58) - 1;
 
     // pack 29 bit base and 29 bit inheriting mask into single 64 bit word
     // guarantee coherent atomic snapshot without torn base or inheriting state
@@ -611,35 +629,20 @@ impl DescriptorState {
     // atomically attenuate both base and inheriting right via compare exchange loop
     // linearize before subsequent syscall entry check while allow in flight io to finish
     pub fn set_rights(&self, new_base_raw: u64, new_inheriting_raw: u64) -> Result<(), WasiErrno> {
-        use std::sync::atomic::Ordering;
-
-        let mut current_packed = self.packed_rights.load(Ordering::Acquire);
-        loop {
-            let mut candidate = DescriptorRights::from_packed_u64(current_packed);
-            candidate.attenuate(new_base_raw, new_inheriting_raw)?;
-            let next_packed = candidate.to_packed_u64();
-            match self.packed_rights.compare_exchange_weak(
-                current_packed,
-                next_packed,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Ok(()),
-                Err(observed) => current_packed = observed,
-            }
-        }
+        attenuate_packed_rights(&self.packed_rights, new_base_raw, new_inheriting_raw)
     }
 
     pub fn fd_flags(&self) -> DescriptorFlags {
         DescriptorFlags(self.fd_flags.load(std::sync::atomic::Ordering::Acquire))
     }
 
+    // reject flag not honored by active io path with wasi_enotsup instead of silent accept
     pub fn set_fd_flags(&self, new_flags_raw: u16) -> Result<(), WasiErrno> {
         let current_rights = self.rights();
         if !current_rights.base.contains(WasiRights::FD_FDSTAT_SET_FLAGS) {
             return Err(WASI_ENOTCAPABLE);
         }
-        let validated = DescriptorFlags::from_raw_validated(new_flags_raw)?;
+        let validated = DescriptorFlags::from_raw_runtime_supported(new_flags_raw)?;
         self.fd_flags
             .store(validated.0, std::sync::atomic::Ordering::Release);
         Ok(())
@@ -664,11 +667,15 @@ impl DescriptorState {
     }
 
     // seek sequential kernel file pointer under descriptor mutex only
+    // fd_tell alone permit whence cur with offset zero since position stay unchanged
     pub fn fd_seek(&self, offset: i64, whence: u8) -> Result<u64, WasiErrno> {
         use std::io::{Seek, SeekFrom};
 
         let current_rights = self.rights();
-        if !current_rights.base.permits_seek() {
+        let is_position_query = whence == 1 && offset == 0;
+        if !current_rights.base.permits_seek()
+            && !(is_position_query && current_rights.base.permits_tell())
+        {
             return Err(WASI_ENOTCAPABLE);
         }
         let file_mutex = match &self.kind {
@@ -925,15 +932,11 @@ impl DescriptorTable {
     }
 
     // remove descriptor from table and drop arc outside table lock
-    // reject closing preopened capability directory fd 3
+    // preopen fd 3 closable per wasi preview 1 fd_close since guest only lose own capability
+    // fd 3 never reallocated because monotonic allocator start at 4
     pub fn close(&self, fd: i32) -> Result<(), WasiErrno> {
         let removed = {
             let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(existing) = guard.entries.get(&fd) {
-                if matches!(existing.kind(), DescriptorKind::PreopenDir { .. }) {
-                    return Err(WASI_ENOTCAPABLE);
-                }
-            }
             guard.entries.remove(&fd)
         };
         match removed {
@@ -943,6 +946,249 @@ impl DescriptorTable {
             }
             None => Err(WASI_EBADF),
         }
+    }
+}
+
+// convert allocated descriptor id to 4 byte little endian wasi abi representation
+// reject negative id or reserved stdio and preopen id below 4
+pub fn encode_abi_fd(fd: i32) -> Result<[u8; 4], WasiErrno> {
+    if fd < 4 {
+        return Err(WASI_EBADF);
+    }
+    let raw = u32::try_from(fd).map_err(|_| WASI_EBADF)?;
+    Ok(raw.to_le_bytes())
+}
+
+// monotonic cas attenuation over packed right word shared by file and stdio descriptor
+// any reserved bit set mean slot closed and yield wasi_ebadf
+fn attenuate_packed_rights(
+    cell: &std::sync::atomic::AtomicU64,
+    new_base_raw: u64,
+    new_inheriting_raw: u64,
+) -> Result<(), WasiErrno> {
+    use std::sync::atomic::Ordering;
+
+    let mut current_packed = cell.load(Ordering::Acquire);
+    loop {
+        if (current_packed & !DescriptorRights::PACKED_VALID_MASK) != 0 {
+            return Err(WASI_EBADF);
+        }
+        let mut candidate = DescriptorRights::from_packed_u64(current_packed);
+        candidate.attenuate(new_base_raw, new_inheriting_raw)?;
+        let next_packed = candidate.to_packed_u64();
+        match cell.compare_exchange_weak(
+            current_packed,
+            next_packed,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(()),
+            Err(observed) => current_packed = observed,
+        }
+    }
+}
+
+pub const WASI_FILETYPE_CHARACTER_DEVICE: u8 = 2;
+
+// wasi preview 1 standard stream at fd 0 1 2
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StdioStream {
+    Stdin,
+    Stdout,
+    Stderr,
+}
+
+impl StdioStream {
+    pub const fn from_fd(fd: i32) -> Option<Self> {
+        match fd {
+            0 => Some(Self::Stdin),
+            1 => Some(Self::Stdout),
+            2 => Some(Self::Stderr),
+            _ => None,
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Stdin => 0,
+            Self::Stdout => 1,
+            Self::Stderr => 2,
+        }
+    }
+
+    // initial right for stream without seek tell setflag or unimplemented poll_oneoff readiness
+    const fn default_rights(self) -> DescriptorRights {
+        let base = match self {
+            Self::Stdin => WasiRights::FD_READ,
+            Self::Stdout | Self::Stderr => WasiRights::FD_WRITE,
+        };
+        DescriptorRights {
+            base: WasiRights(base),
+            inheriting: WasiRights::EMPTY,
+        }
+    }
+}
+
+// host owned per instance standard stream descriptor managed outside descriptortable
+// keep stdio separate from filesystem capability so stdio never alias preopen or file handle
+// stdin use explicit no host stream policy and return eof zero byte until closed
+pub struct StdioDescriptors {
+    slots: [std::sync::atomic::AtomicU64; 3],
+    stdout_sink: std::sync::Mutex<Box<dyn std::io::Write + Send>>,
+    stderr_sink: std::sync::Mutex<Box<dyn std::io::Write + Send>>,
+}
+
+impl StdioDescriptors {
+    // reserved bit 58..64 all set mark closed slot and never collide with valid packed right
+    const CLOSED_SENTINEL: u64 = u64::MAX;
+
+    pub fn new() -> Self {
+        Self::with_sinks(Box::new(std::io::sink()), Box::new(std::io::sink()))
+    }
+
+    pub fn with_sinks(
+        stdout_sink: Box<dyn std::io::Write + Send>,
+        stderr_sink: Box<dyn std::io::Write + Send>,
+    ) -> Self {
+        Self {
+            slots: [
+                std::sync::atomic::AtomicU64::new(
+                    StdioStream::Stdin.default_rights().to_packed_u64(),
+                ),
+                std::sync::atomic::AtomicU64::new(
+                    StdioStream::Stdout.default_rights().to_packed_u64(),
+                ),
+                std::sync::atomic::AtomicU64::new(
+                    StdioStream::Stderr.default_rights().to_packed_u64(),
+                ),
+            ],
+            stdout_sink: std::sync::Mutex::new(stdout_sink),
+            stderr_sink: std::sync::Mutex::new(stderr_sink),
+        }
+    }
+
+    // load coherent right snapshot or wasi_ebadf when stream closed
+    pub fn rights(&self, stream: StdioStream) -> Result<DescriptorRights, WasiErrno> {
+        let packed = self.slots[stream.index()].load(std::sync::atomic::Ordering::Acquire);
+        if packed == Self::CLOSED_SENTINEL {
+            return Err(WASI_EBADF);
+        }
+        Ok(DescriptorRights::from_packed_u64(packed))
+    }
+
+    // verify stream open and base right contain required mask
+    pub fn require(&self, stream: StdioStream, required: u64) -> Result<(), WasiErrno> {
+        if self.rights(stream)?.base.contains(required) {
+            Ok(())
+        } else {
+            Err(WASI_ENOTCAPABLE)
+        }
+    }
+
+    // read from standard stream where stdin return eof zero byte by default policy
+    pub fn read_stream(&self, stream: StdioStream) -> Result<usize, WasiErrno> {
+        self.require(stream, WasiRights::FD_READ)?;
+        match stream {
+            StdioStream::Stdin => Ok(0),
+            StdioStream::Stdout | StdioStream::Stderr => Err(WASI_ENOTCAPABLE),
+        }
+    }
+
+    // write vectored slice to configured per instance stdout or stderr sink
+    // honor partial write count and map underlying sink failure to wasi_eio
+    pub fn write_stream(&self, stream: StdioStream, slices: &[&[u8]]) -> Result<usize, WasiErrno> {
+        self.require(stream, WasiRights::FD_WRITE)?;
+        let sink_mutex = match stream {
+            StdioStream::Stdout => &self.stdout_sink,
+            StdioStream::Stderr => &self.stderr_sink,
+            StdioStream::Stdin => return Err(WASI_ENOTCAPABLE),
+        };
+        let mut sink = sink_mutex.lock().unwrap_or_else(|e| e.into_inner());
+        let mut total_written = 0usize;
+        for slice in slices {
+            if slice.is_empty() {
+                continue;
+            }
+            match sink.write(slice) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let actual = n.min(slice.len());
+                    total_written = total_written.checked_add(actual).ok_or(WASI_EINVAL)?;
+                    if actual < slice.len() {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    if total_written > 0 {
+                        break;
+                    }
+                    return Err(WASI_EIO);
+                }
+            }
+        }
+        Ok(total_written)
+    }
+
+    // stdio fdflag stay empty because runtime honor no settable flag on stream
+    pub fn fd_fdstat_get(&self, stream: StdioStream) -> Result<WasiFdstat, WasiErrno> {
+        let rights = self.rights(stream)?;
+        Ok(WasiFdstat {
+            fs_filetype: WASI_FILETYPE_CHARACTER_DEVICE,
+            fs_flags: DescriptorFlags::EMPTY,
+            fs_rights_base: rights.base,
+            fs_rights_inheriting: rights.inheriting,
+        })
+    }
+
+    pub fn set_rights(
+        &self,
+        stream: StdioStream,
+        new_base_raw: u64,
+        new_inheriting_raw: u64,
+    ) -> Result<(), WasiErrno> {
+        attenuate_packed_rights(&self.slots[stream.index()], new_base_raw, new_inheriting_raw)
+    }
+
+    // flag never stored since runtime_supported is empty and clearing is no op
+    pub fn set_fd_flags(&self, stream: StdioStream, new_flags_raw: u16) -> Result<(), WasiErrno> {
+        self.require(stream, WasiRights::FD_FDSTAT_SET_FLAGS)?;
+        DescriptorFlags::from_raw_runtime_supported(new_flags_raw)?;
+        Ok(())
+    }
+
+    // close stream slot once and reject double close with wasi_ebadf
+    pub fn close(&self, stream: StdioStream) -> Result<(), WasiErrno> {
+        let previous = self.slots[stream.index()]
+            .swap(Self::CLOSED_SENTINEL, std::sync::atomic::Ordering::AcqRel);
+        if previous == Self::CLOSED_SENTINEL {
+            Err(WASI_EBADF)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+// open host directory handle for descriptor table initialization without follow symlink
+pub fn open_directory_handle(path: &std::path::Path) -> Result<std::fs::File, WasiErrno> {
+    #[cfg(windows)]
+    {
+        windows::open_directory_for_containment(path)
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|e| match e.raw_os_error() {
+                Some(libc::ENOENT) => WASI_ENOENT,
+                Some(libc::EACCES) => WASI_EACCES,
+                Some(libc::EPERM) => WASI_EPERM,
+                Some(libc::ENOTDIR) => WASI_ENOTDIR,
+                Some(libc::ELOOP) => WASI_ENOTCAPABLE,
+                _ => WASI_EIO,
+            })
     }
 }
 
@@ -997,6 +1243,7 @@ mod tests {
         assert_eq!(WASI_ENOENT, 44);
         assert_eq!(WASI_ENOSYS, 52);
         assert_eq!(WASI_ENOTDIR, 54);
+        assert_eq!(WASI_ENOTSUP, 58);
         assert_eq!(WASI_EPERM, 63);
         assert_eq!(WASI_EROFS, 69);
         assert_eq!(WASI_EXDEV, 75);
@@ -1040,6 +1287,7 @@ mod tests {
 
         // verify supported mask never include unsupported operation even when protocol valid
         let unsupported = WasiRights::SOCK_SHUTDOWN
+            | WasiRights::POLL_FD_READWRITE
             | WasiRights::PATH_SYMLINK
             | WasiRights::PATH_READLINK
             | WasiRights::PATH_RENAME_SOURCE
@@ -1403,7 +1651,7 @@ mod tests {
         assert!(seek_read_file.base.permits_tell());
         assert!(!seek_read_file.base.permits_write());
 
-        // reject unsupported protocol valid right such as sock_shutdown or path_symlink
+        // reject unsupported protocol valid right such as sock_shutdown poll_fd_readwrite or path_symlink
         assert_eq!(
             parent.derive_child_rights(
                 false,
@@ -1411,6 +1659,17 @@ mod tests {
                 false,
                 DescriptorFlags::EMPTY,
                 WasiRights::FD_READ | WasiRights::SOCK_SHUTDOWN,
+                0,
+            ),
+            Err(WASI_ENOTCAPABLE)
+        );
+        assert_eq!(
+            parent.derive_child_rights(
+                false,
+                false,
+                false,
+                DescriptorFlags::EMPTY,
+                WasiRights::FD_READ | WasiRights::POLL_FD_READWRITE,
                 0,
             ),
             Err(WASI_ENOTCAPABLE)
@@ -1577,8 +1836,10 @@ mod tests {
 
         // validate fd_flags update and unknown flag rejection
         assert_eq!(file_desc.set_fd_flags(1 << 9), Err(WASI_EINVAL));
-        file_desc.set_fd_flags(DescriptorFlags::APPEND).unwrap();
-        assert_eq!(file_desc.fd_flags(), DescriptorFlags(DescriptorFlags::APPEND));
+        // append not honored by active write path until b3.2 so reject with enotsup
+        assert_eq!(file_desc.set_fd_flags(DescriptorFlags::APPEND), Err(WASI_ENOTSUP));
+        file_desc.set_fd_flags(DescriptorFlags::EMPTY.0).unwrap();
+        assert_eq!(file_desc.fd_flags(), DescriptorFlags::EMPTY);
 
         // attenuate regular file descriptor to drop write and fdstat_set_flags right
         file_desc
@@ -1600,7 +1861,7 @@ mod tests {
     }
 
     #[test]
-    fn test_b2_2_descriptor_id_monotonic_non_reuse_and_preopen_protection() {
+    fn test_b2_2_descriptor_id_monotonic_non_reuse_and_preopen_close() {
         let temp_dir =
             std::env::temp_dir().join(format!("plug_b22_mono_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -1613,9 +1874,17 @@ mod tests {
 
         let table = DescriptorTable::new_with_preopen(root_file, "/data");
 
-        // preopen capability directory at fd 3 must reject fd_close with enotcapable
-        assert_eq!(table.close(3), Err(WASI_ENOTCAPABLE));
-        assert!(table.get(3).is_ok());
+        // guest may close preopen fd 3 per wasi preview 1 and only lose own capability
+        // in flight arc keep root handle alive after removal from table
+        let inflight_preopen = table.get(3).unwrap();
+        assert_eq!(table.close(3), Ok(()));
+        assert_eq!(table.get(3).err(), Some(WASI_EBADF));
+        assert_eq!(table.close(3), Err(WASI_EBADF));
+        assert!(matches!(
+            inflight_preopen.kind(),
+            DescriptorKind::PreopenDir { guest_path: "/data", .. }
+        ));
+        drop(inflight_preopen);
 
         let file_path = temp_dir.join("mono.bin");
         std::fs::write(&file_path, b"abc").unwrap();
@@ -1633,6 +1902,7 @@ mod tests {
             DescriptorState::new_regular_file(f, rights, DescriptorFlags::EMPTY).unwrap()
         };
 
+        // closed fd 3 never reallocated since allocator start at 4
         let fd4 = table.insert(make_reg()).unwrap();
         let fd5 = table.insert(make_reg()).unwrap();
         let fd6 = table.insert(make_reg()).unwrap();
@@ -2111,5 +2381,275 @@ mod tests {
         assert_eq!(table.insert(make_reg()), Err(WASI_EMFILE));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_b3_1_encode_abi_fd_checked_conversion() {
+        assert_eq!(encode_abi_fd(i32::MIN), Err(WASI_EBADF));
+        assert_eq!(encode_abi_fd(-1), Err(WASI_EBADF));
+        assert_eq!(encode_abi_fd(0), Err(WASI_EBADF));
+        assert_eq!(encode_abi_fd(1), Err(WASI_EBADF));
+        assert_eq!(encode_abi_fd(2), Err(WASI_EBADF));
+        assert_eq!(encode_abi_fd(3), Err(WASI_EBADF));
+        assert_eq!(encode_abi_fd(4), Ok(4u32.to_le_bytes()));
+        assert_eq!(encode_abi_fd(i32::MAX), Ok((i32::MAX as u32).to_le_bytes()));
+    }
+
+    #[test]
+    fn test_b3_1_fd_seek_tell_only_permit_cur_zero_query() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("plug_b31_tell_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let file_path = temp_dir.join("tell.bin");
+        std::fs::write(&file_path, b"0123456789").unwrap();
+
+        let open_with = |mask: u64| {
+            let f = std::fs::OpenOptions::new().read(true).open(&file_path).unwrap();
+            let rights = DescriptorRights::for_regular_file(WasiRights(mask)).unwrap();
+            DescriptorState::new_regular_file(f, rights, DescriptorFlags::EMPTY).unwrap()
+        };
+
+        // fd_tell alone permit only position query whence cur offset zero
+        let tell_only = open_with(WasiRights::FD_READ | WasiRights::FD_TELL);
+        assert_eq!(tell_only.fd_seek(0, 1), Ok(0));
+        assert_eq!(tell_only.fd_tell(), Ok(0));
+        assert_eq!(tell_only.fd_seek(3, 1), Err(WASI_ENOTCAPABLE));
+        assert_eq!(tell_only.fd_seek(-1, 1), Err(WASI_ENOTCAPABLE));
+        assert_eq!(tell_only.fd_seek(0, 0), Err(WASI_ENOTCAPABLE));
+        assert_eq!(tell_only.fd_seek(0, 2), Err(WASI_ENOTCAPABLE));
+
+        // fd_seek imply fd_tell and permit all whence
+        let seek_only = open_with(WasiRights::FD_READ | WasiRights::FD_SEEK);
+        assert_eq!(seek_only.fd_seek(4, 0), Ok(4));
+        assert_eq!(seek_only.fd_seek(2, 1), Ok(6));
+        assert_eq!(seek_only.fd_seek(0, 1), Ok(6));
+        assert_eq!(seek_only.fd_tell(), Ok(6));
+        assert_eq!(seek_only.fd_seek(-1, 2), Ok(9));
+
+        // attenuate seek while keep tell then only position query remain
+        seek_only
+            .set_rights(WasiRights::FD_READ | WasiRights::FD_TELL, 0)
+            .unwrap();
+        assert_eq!(seek_only.fd_seek(0, 1), Ok(9));
+        assert_eq!(seek_only.fd_seek(0, 0), Err(WASI_ENOTCAPABLE));
+
+        // neither seek nor tell reject every positioning call
+        let neither = open_with(WasiRights::FD_READ);
+        assert_eq!(neither.fd_seek(0, 1), Err(WASI_ENOTCAPABLE));
+        assert_eq!(neither.fd_tell(), Err(WASI_ENOTCAPABLE));
+
+        drop((tell_only, seek_only, neither));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_b3_1_fdflags_runtime_supported_policy() {
+        assert_eq!(DescriptorFlags::from_raw_runtime_supported(0), Ok(DescriptorFlags::EMPTY));
+        for flag in [
+            DescriptorFlags::APPEND,
+            DescriptorFlags::DSYNC,
+            DescriptorFlags::NONBLOCK,
+            DescriptorFlags::RSYNC,
+            DescriptorFlags::SYNC,
+        ] {
+            assert_eq!(DescriptorFlags::from_raw_runtime_supported(flag), Err(WASI_ENOTSUP));
+        }
+        assert_eq!(DescriptorFlags::from_raw_runtime_supported(1 << 5), Err(WASI_EINVAL));
+        assert_eq!(DescriptorFlags::from_raw_runtime_supported(u16::MAX), Err(WASI_EINVAL));
+    }
+
+    #[test]
+    fn test_b3_1_stdio_descriptor_lifecycle_rights_and_fdstat() {
+        let stdio = StdioDescriptors::new();
+
+        assert_eq!(StdioStream::from_fd(0), Some(StdioStream::Stdin));
+        assert_eq!(StdioStream::from_fd(1), Some(StdioStream::Stdout));
+        assert_eq!(StdioStream::from_fd(2), Some(StdioStream::Stderr));
+        assert_eq!(StdioStream::from_fd(3), None);
+        assert_eq!(StdioStream::from_fd(-1), None);
+
+        // stdin read only and stdout stderr write only without seek tell setflag or poll_fd_readwrite
+        let stdin_st = stdio.fd_fdstat_get(StdioStream::Stdin).unwrap();
+        assert_eq!(stdin_st.fs_filetype, WASI_FILETYPE_CHARACTER_DEVICE);
+        assert_eq!(stdin_st.fs_flags, DescriptorFlags::EMPTY);
+        assert_eq!(stdin_st.fs_rights_base, WasiRights(WasiRights::FD_READ));
+        assert!(!stdin_st.fs_rights_base.contains(WasiRights::POLL_FD_READWRITE));
+        assert_eq!(stdin_st.fs_rights_inheriting, WasiRights::EMPTY);
+        for stream in [StdioStream::Stdout, StdioStream::Stderr] {
+            let st = stdio.fd_fdstat_get(stream).unwrap();
+            assert_eq!(st.fs_filetype, WASI_FILETYPE_CHARACTER_DEVICE);
+            assert_eq!(st.fs_rights_base, WasiRights(WasiRights::FD_WRITE));
+            assert!(!st.fs_rights_base.contains(WasiRights::POLL_FD_READWRITE));
+        }
+        assert_eq!(stdio.require(StdioStream::Stdin, WasiRights::FD_READ), Ok(()));
+        assert_eq!(stdio.require(StdioStream::Stdin, WasiRights::FD_WRITE), Err(WASI_ENOTCAPABLE));
+        assert_eq!(stdio.require(StdioStream::Stdin, WasiRights::POLL_FD_READWRITE), Err(WASI_ENOTCAPABLE));
+        assert_eq!(stdio.require(StdioStream::Stdout, WasiRights::FD_WRITE), Ok(()));
+        assert_eq!(stdio.require(StdioStream::Stdout, WasiRights::FD_READ), Err(WASI_ENOTCAPABLE));
+        assert_eq!(stdio.require(StdioStream::Stdout, WasiRights::POLL_FD_READWRITE), Err(WASI_ENOTCAPABLE));
+        assert_eq!(stdio.require(StdioStream::Stderr, WasiRights::FD_SEEK), Err(WASI_ENOTCAPABLE));
+
+        // stdio lack fdstat_set_flags right
+        assert_eq!(stdio.set_fd_flags(StdioStream::Stdout, 0), Err(WASI_ENOTCAPABLE));
+
+        // monotonic attenuation and escalation rejection on stdio
+        assert_eq!(
+            stdio.set_rights(StdioStream::Stderr, WasiRights::FD_WRITE | WasiRights::FD_SEEK, 0),
+            Err(WASI_ENOTCAPABLE)
+        );
+        assert_eq!(
+            stdio.set_rights(StdioStream::Stderr, WasiRights::FD_WRITE | WasiRights::POLL_FD_READWRITE, 0),
+            Err(WASI_ENOTCAPABLE)
+        );
+        assert_eq!(stdio.set_rights(StdioStream::Stderr, 0, 0), Ok(()));
+        assert_eq!(stdio.require(StdioStream::Stderr, WasiRights::FD_WRITE), Err(WASI_ENOTCAPABLE));
+        assert_eq!(
+            stdio.set_rights(StdioStream::Stderr, WasiRights::FD_WRITE, 0),
+            Err(WASI_ENOTCAPABLE)
+        );
+
+        // close once then every operation yield ebadf while sibling stream stay open
+        assert_eq!(stdio.close(StdioStream::Stdout), Ok(()));
+        assert_eq!(stdio.close(StdioStream::Stdout), Err(WASI_EBADF));
+        assert_eq!(stdio.fd_fdstat_get(StdioStream::Stdout).err(), Some(WASI_EBADF));
+        assert_eq!(stdio.rights(StdioStream::Stdout).err(), Some(WASI_EBADF));
+        assert_eq!(stdio.require(StdioStream::Stdout, WasiRights::FD_WRITE), Err(WASI_EBADF));
+        assert_eq!(stdio.set_rights(StdioStream::Stdout, 0, 0), Err(WASI_EBADF));
+        assert_eq!(stdio.set_fd_flags(StdioStream::Stdout, 0), Err(WASI_EBADF));
+        assert!(stdio.fd_fdstat_get(StdioStream::Stdin).is_ok());
+        assert!(stdio.fd_fdstat_get(StdioStream::Stderr).is_ok());
+    }
+
+    #[test]
+    fn test_b3_1_stdio_sink_io_partial_write_error_and_instance_isolation() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct SharedTestSink {
+            buf: Arc<Mutex<Vec<u8>>>,
+            max_write_per_call: Option<usize>,
+            fail_on_call: Option<usize>,
+            calls: Arc<Mutex<usize>>,
+        }
+
+        impl SharedTestSink {
+            fn new() -> (Self, Arc<Mutex<Vec<u8>>>) {
+                let buf = Arc::new(Mutex::new(Vec::new()));
+                (
+                    Self {
+                        buf: Arc::clone(&buf),
+                        max_write_per_call: None,
+                        fail_on_call: None,
+                        calls: Arc::new(Mutex::new(0)),
+                    },
+                    buf,
+                )
+            }
+        }
+
+        impl std::io::Write for SharedTestSink {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                if self.fail_on_call == Some(*calls) {
+                    return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "sink io fail"));
+                }
+                let take = match self.max_write_per_call {
+                    Some(limit) => data.len().min(limit),
+                    None => data.len(),
+                };
+                self.buf.lock().unwrap().extend_from_slice(&data[..take]);
+                Ok(take)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // 1. two independent plugin instances with distinct stdout and stderr sink
+        let (out_a_sink, out_a_buf) = SharedTestSink::new();
+        let (err_a_sink, err_a_buf) = SharedTestSink::new();
+        let inst_a = StdioDescriptors::with_sinks(Box::new(out_a_sink), Box::new(err_a_sink));
+
+        let (out_b_sink, out_b_buf) = SharedTestSink::new();
+        let (err_b_sink, err_b_buf) = SharedTestSink::new();
+        let inst_b = StdioDescriptors::with_sinks(Box::new(out_b_sink), Box::new(err_b_sink));
+
+        // verify stdout and stderr write to their respective sink with exact byte count
+        let n_out_a = inst_a
+            .write_stream(StdioStream::Stdout, &[b"alpha-", b"stdout"])
+            .unwrap();
+        assert_eq!(n_out_a, 12);
+        assert_eq!(out_a_buf.lock().unwrap().as_slice(), b"alpha-stdout");
+        assert!(err_a_buf.lock().unwrap().is_empty());
+
+        let n_err_a = inst_a
+            .write_stream(StdioStream::Stderr, &[b"alpha-stderr"])
+            .unwrap();
+        assert_eq!(n_err_a, 12);
+        assert_eq!(err_a_buf.lock().unwrap().as_slice(), b"alpha-stderr");
+
+        // verify stdin return eof zero byte and reject write
+        assert_eq!(inst_a.read_stream(StdioStream::Stdin), Ok(0));
+        assert_eq!(
+            inst_a.write_stream(StdioStream::Stdin, &[b"x"]),
+            Err(WASI_ENOTCAPABLE)
+        );
+        assert_eq!(inst_a.read_stream(StdioStream::Stdout), Err(WASI_ENOTCAPABLE));
+        assert_eq!(inst_a.read_stream(StdioStream::Stderr), Err(WASI_ENOTCAPABLE));
+
+        // 2. closing fd 0 1 2 in instance a must not affect instance b
+        assert_eq!(inst_a.close(StdioStream::Stdin), Ok(()));
+        assert_eq!(inst_a.close(StdioStream::Stdout), Ok(()));
+        assert_eq!(inst_a.close(StdioStream::Stderr), Ok(()));
+        assert_eq!(inst_a.close(StdioStream::Stdin), Err(WASI_EBADF));
+        assert_eq!(inst_a.close(StdioStream::Stdout), Err(WASI_EBADF));
+        assert_eq!(inst_a.close(StdioStream::Stderr), Err(WASI_EBADF));
+        assert_eq!(inst_a.read_stream(StdioStream::Stdin), Err(WASI_EBADF));
+        assert_eq!(inst_a.write_stream(StdioStream::Stdout, &[b"x"]), Err(WASI_EBADF));
+        assert_eq!(inst_a.write_stream(StdioStream::Stderr, &[b"x"]), Err(WASI_EBADF));
+
+        assert_eq!(inst_b.read_stream(StdioStream::Stdin), Ok(0));
+        assert_eq!(
+            inst_b.write_stream(StdioStream::Stdout, &[b"bravo-out"]),
+            Ok(9)
+        );
+        assert_eq!(
+            inst_b.write_stream(StdioStream::Stderr, &[b"bravo-err"]),
+            Ok(9)
+        );
+        assert_eq!(out_b_buf.lock().unwrap().as_slice(), b"bravo-out");
+        assert_eq!(err_b_buf.lock().unwrap().as_slice(), b"bravo-err");
+
+        // 3. partial write stop at short write boundary and report exact nwritten
+        let (mut partial_out_sink, partial_out_buf) = SharedTestSink::new();
+        partial_out_sink.max_write_per_call = Some(4);
+        let (dummy_err_sink, _) = SharedTestSink::new();
+        let inst_partial =
+            StdioDescriptors::with_sinks(Box::new(partial_out_sink), Box::new(dummy_err_sink));
+        let n_partial = inst_partial
+            .write_stream(StdioStream::Stdout, &[b"12345678", b"90"])
+            .unwrap();
+        assert_eq!(n_partial, 4);
+        assert_eq!(partial_out_buf.lock().unwrap().as_slice(), b"1234");
+
+        // 4. sink io error on first chunk return wasi_eio and on second chunk return prior nwritten
+        let (mut fail_first_sink, _) = SharedTestSink::new();
+        fail_first_sink.fail_on_call = Some(1);
+        let (mut fail_second_sink, fail_second_buf) = SharedTestSink::new();
+        fail_second_sink.fail_on_call = Some(2);
+        let inst_err =
+            StdioDescriptors::with_sinks(Box::new(fail_first_sink), Box::new(fail_second_sink));
+        assert_eq!(
+            inst_err.write_stream(StdioStream::Stdout, &[b"boom"]),
+            Err(WASI_EIO)
+        );
+        assert_eq!(
+            inst_err.write_stream(StdioStream::Stderr, &[b"ok-first", b"fail-second"]),
+            Ok(8)
+        );
+        assert_eq!(fail_second_buf.lock().unwrap().as_slice(), b"ok-first");
     }
 }
